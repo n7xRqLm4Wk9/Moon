@@ -619,7 +619,7 @@ local import = ...
 
 local Moon = import("Core/Moon")
 local Services = import("Core/Services")
-local RunService = Services.RunService
+local RunService, Players = Services.RunService, Services.Players
 local Fonts = import("Core/Fonts")
 local FONT, FONT_BOLD = Fonts.FONT, Fonts.FONT_BOLD
 local Colors = import("Theme/Colors")
@@ -655,11 +655,35 @@ Moon.ESP = ESP
 local Object = {}
 Object.__index = Object
 
+-- where the overlays live: hidden UI first, then CoreGui, then PlayerGui (whichever accepts them)
 local function folder()
-	if not ESP._folder or not ESP._folder.Parent then
-		ESP._folder = Create("Folder", { Name = "MoonESP", Parent = GetGuiParent() })
+	if ESP._folder and ESP._folder.Parent then
+		return ESP._folder
 	end
-	return ESP._folder
+	local candidates = {
+		function()
+			return GetGuiParent()
+		end,
+		function()
+			return game:GetService("CoreGui")
+		end,
+		function()
+			return Players.LocalPlayer:WaitForChild("PlayerGui")
+		end,
+	}
+	for _, getParent in ipairs(candidates) do
+		local ok, result = pcall(function()
+			local made = Instance.new("Folder")
+			made.Name = "MoonESP"
+			made.Parent = getParent()
+			return made
+		end)
+		if ok and result and result.Parent then
+			ESP._folder = result
+			return result
+		end
+	end
+	error("[Moon.ESP] could not find a place to put the overlays")
 end
 
 local function rootOf(target)
@@ -731,7 +755,6 @@ function Object:_build(size)
 		AlwaysOnTop = true,
 		Size = UDim2.fromOffset(40, 60),
 		LightInfluence = 0,
-		ResetOnSpawn = false,
 		Active = false,
 		Enabled = false,
 		Parent = folder(),
@@ -769,15 +792,13 @@ function Object:_build(size)
 		StudsOffsetWorldSpace = Vector3.new(0, size.Y / 2 + 0.8, 0),
 		SizeOffset = Vector2.new(0, 0.5),
 		LightInfluence = 0,
-		ResetOnSpawn = false,
 		Active = false,
 		Enabled = false,
 		Parent = folder(),
 	})
-	self._group = Create("CanvasGroup", {
+	self._group = Create("Frame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
-		GroupTransparency = 1,
 		Parent = self.TagGui,
 	})
 	self._pop = Create("UIScale", { Parent = self._group })
@@ -915,9 +936,7 @@ function Object:_setShown(shown)
 		self._highlight.Enabled = shown and opt(self, "Highlight")
 	end
 	if shown then
-		self._group.GroupTransparency = 1
-		self._pop.Scale = 0.85
-		Tween(self._group, { GroupTransparency = 0 }, 0.25)
+		self._pop.Scale = 0.8
 		Tween(self._pop, { Scale = 1 }, 0.3, Enum.EasingStyle.Back)
 	end
 end
@@ -1144,7 +1163,19 @@ function ESP:Add(target, opts)
 		_low = false,
 		_conns = {},
 	}, Object)
-	object:_build(size)
+	local built, buildError = pcall(function()
+		object:_build(size)
+	end)
+	if not built then
+		warn("[Moon.ESP] could not build the overlay: " .. tostring(buildError))
+		if object.BoxGui then
+			object.BoxGui:Destroy()
+		end
+		if object.TagGui then
+			object.TagGui:Destroy()
+		end
+		return nil
+	end
 	object._name.Text = object.Name
 	table.insert(object._conns, target.AncestryChanged:Connect(function(_, parent)
 		if parent == nil then
@@ -1195,6 +1226,78 @@ function ESP:Configure(settings)
 		object:Refresh()
 	end
 	return ESP
+end
+
+-- Spawns a harmless local dummy in front of your camera so you can see the ESP working without
+-- any other players. Its health drops every couple of seconds. Remove it with ESP:StopDemo().
+function ESP:Demo()
+	ESP:StopDemo()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		warn("[Moon.ESP] no camera yet")
+		return nil
+	end
+	local look = camera.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+	local origin = camera.CFrame.Position + flat * 16
+	local facing = CFrame.new(origin, origin - flat)
+
+	local model = Instance.new("Model")
+	model.Name = "MoonDemoDummy"
+	local function part(name, size, offset, color)
+		local piece = Instance.new("Part")
+		piece.Name = name
+		piece.Size = size
+		piece.Anchored = true
+		piece.CanCollide = false
+		piece.CanQuery = false
+		piece.CanTouch = false
+		piece.Material = Enum.Material.SmoothPlastic
+		piece.Color = color
+		piece.CFrame = facing * CFrame.new(offset)
+		piece.Parent = model
+		return piece
+	end
+	local skin, shirt, pants = RGB(226, 190, 150), RGB(70, 90, 160), RGB(50, 54, 70)
+	local root = part("HumanoidRootPart", Vector3.new(2, 2, 1), Vector3.new(0, 0, 0), shirt)
+	part("Head", Vector3.new(1.4, 1.4, 1.4), Vector3.new(0, 1.9, 0), skin)
+	part("LeftArm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 0, 0), shirt)
+	part("RightArm", Vector3.new(1, 2, 1), Vector3.new(1.5, 0, 0), shirt)
+	part("LeftLeg", Vector3.new(1, 2, 1), Vector3.new(-0.5, -2, 0), pants)
+	part("RightLeg", Vector3.new(1, 2, 1), Vector3.new(0.5, -2, 0), pants)
+	model.PrimaryPart = root
+	model.Parent = workspace
+
+	local object = ESP:Add(model, {
+		Name = "Dummy",
+		Health = 100,
+		MaxHealth = 100,
+		Lines = { "Moon demo", "Takes damage" },
+	})
+	ESP._demo = model
+	task.spawn(function()
+		local health = 100
+		while ESP._demo == model and model.Parent do
+			task.wait(1.6)
+			health = health - 20
+			if health < 0 then
+				health = 100
+			end
+			if object and ESP._objects[model] == object then
+				object:SetHealth(health, 100)
+			end
+		end
+	end)
+	return object
+end
+
+function ESP:StopDemo()
+	local model = ESP._demo
+	ESP._demo = nil
+	if model then
+		model:Destroy()
+	end
 end
 
 return ESP
@@ -3393,6 +3496,35 @@ function Elements:AddAccentPicker(opts)
 end
 
 -- Ready-made slider for the background blur strength
+-- Ready-made slider that scales the whole window (handy on small phones).
+-- The window resizes a moment after you let go, so the slider does not move under your finger.
+function Elements:AddScaleSlider(opts)
+	opts = opts or {}
+	local window = self.Window
+	local userCallback = opts.Callback
+	local token = 0
+	return self:AddSlider({
+		Name = opts.Name or "UI scale",
+		Description = opts.Description or "Bigger or smaller window",
+		Min = 60,
+		Max = 160,
+		Increment = 5,
+		Suffix = "%",
+		Default = math.floor(window:GetScale() * 100 + 0.5),
+		Flag = opts.Flag or "UI.Scale",
+		Callback = function(value)
+			token = token + 1
+			local mine = token
+			task.delay(0.35, function()
+				if token == mine then
+					window:SetScale(value / 100)
+				end
+			end)
+			Safe(userCallback, value)
+		end,
+	})
+end
+
 function Elements:AddBlurSlider(opts)
 	opts = opts or {}
 	local window = self.Window
@@ -4035,6 +4167,7 @@ local Window = import("Window/Window")
 local BuildWatermark = import("Window/Watermark")
 local BuildPlayerCard = import("Window/PlayerCard")
 local BuildOpenButton = import("Window/OpenButton")
+local BuildResizeGrip = import("Window/ResizeGrip")
 local Services = import("Core/Services")
 local Players, UserInputService, Lighting, RunService, GuiService = Services.Players, Services.UserInputService, Services.Lighting, Services.RunService, Services.GuiService
 local Fonts = import("Core/Fonts")
@@ -4143,6 +4276,8 @@ function Moon:CreateWindow(opts)
 	self.Main = main
 	local scale = Create("UIScale", { Parent = main })
 	self._scale = scale
+	self._userScale = opts.Scale or 1
+	self._normalSize = size
 
 	-- soft colored sheen across the glass (fades from top-left to transparent)
 	local sheen = Create("Frame", {
@@ -4371,18 +4506,27 @@ function Moon:CreateWindow(opts)
 	-- open button (draggable, shown while the window is hidden)
 	BuildOpenButton(self, overlay, opts)
 
+	-- resize grip (bottom-right corner)
+	self._grip = BuildResizeGrip(self, main)
+
 	-- maximize / restore
 	local maximized = false
 	local restoreSize, restorePos = size, main.Position
 	maxBtn.MouseButton1Click:Connect(function()
 		maximized = not maximized
+		self._maximized = maximized
 		if maximized then
 			restoreSize, restorePos = main.Size, main.Position
 			mainCorner.CornerRadius = UDim.new(0, 0)
 			Tween(main, { Size = UDim2.fromScale(1, 1), Position = UDim2.fromScale(0.5, 0.5) }, 0.22)
 		else
 			mainCorner.CornerRadius = UDim.new(0, 8)
+			self._normalSize = restoreSize
 			Tween(main, { Size = restoreSize, Position = restorePos }, 0.22)
+		end
+		Tween(scale, { Scale = self:_scaleTarget() }, 0.22)
+		if self._grip then
+			self._grip.Visible = not maximized
 		end
 	end)
 	minBtn.MouseButton1Click:Connect(function()
@@ -4427,9 +4571,10 @@ function Moon:CreateWindow(opts)
 	-- intro animation
 	self:_syncBlur()
 	main.GroupTransparency = 1
-	scale.Scale = 0.95
+	local introScale = self:_scaleTarget()
+	scale.Scale = 0.95 * introScale
 	Tween(main, { GroupTransparency = 0 }, 0.28)
-	Tween(scale, { Scale = 1 }, 0.32, Enum.EasingStyle.Back)
+	Tween(scale, { Scale = introScale }, 0.32, Enum.EasingStyle.Back)
 
 	table.insert(Moon.Windows, self)
 	return self
@@ -4737,6 +4882,92 @@ local function BuildPlayerCard(self, nav, gui, navWidth, localPlayer)
 end
 
 return BuildPlayerCard
+end
+
+modules["Window/ResizeGrip"] = function(...)
+-- Resize grip in the bottom-right corner: drag it to resize the window (not available while maximized).
+local import = ...
+
+local Services = import("Core/Services")
+local UserInputService = Services.UserInputService
+local Util = import("Core/Util")
+local Create, IsPress, IsMove = Util.Create, Util.IsPress, Util.IsMove
+local Binding = import("Theme/Binding")
+local Bind = Binding.Bind
+
+local MIN_WIDTH, MIN_HEIGHT = 380, 270
+
+local function BuildResizeGrip(self, main)
+	-- a big invisible touch target with a small triangle of dots
+	local grip = Create("TextButton", {
+		Name = "ResizeGrip",
+		Size = UDim2.fromOffset(30, 30),
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = main,
+	})
+	for _, dot in ipairs({ { 5, 5 }, { 10, 5 }, { 15, 5 }, { 5, 10 }, { 10, 10 }, { 5, 15 } }) do
+		local mark = Create("Frame", {
+			Size = UDim2.fromOffset(2, 2),
+			AnchorPoint = Vector2.new(1, 1),
+			Position = UDim2.new(1, -dot[1], 1, -dot[2]),
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			Parent = grip,
+		})
+		Bind(self, mark, "BackgroundColor3", "SubText")
+	end
+
+	local dragging, dragInput, startPointer, startPos, startWidth, startHeight, startScale
+	grip.InputBegan:Connect(function(input)
+		if IsPress(input) and not self._maximized then
+			dragging = true
+			dragInput = input
+			startPointer = input.Position
+			startPos = main.Position
+			startScale = math.max(self._scale.Scale, 0.1)
+			startWidth = main.AbsoluteSize.X / startScale
+			startHeight = main.AbsoluteSize.Y / startScale
+		end
+	end)
+
+	self:_connect(UserInputService.InputChanged, function(input)
+		if not dragging or not IsMove(input) then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Touch and input ~= dragInput then
+			return
+		end
+		local view = self.Gui.AbsoluteSize
+		local delta = input.Position - startPointer
+		local width = math.clamp(startWidth + delta.X / startScale, MIN_WIDTH, math.max(MIN_WIDTH, (view.X - 12) / startScale))
+		local height = math.clamp(startHeight + delta.Y / startScale, MIN_HEIGHT, math.max(MIN_HEIGHT, (view.Y - 12) / startScale))
+		main.Size = UDim2.fromOffset(width, height)
+		-- the window is centered on its position, so move it by half the change to keep the top-left corner still
+		main.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + (width - startWidth) * startScale / 2,
+			startPos.Y.Scale, startPos.Y.Offset + (height - startHeight) * startScale / 2
+		)
+		self._normalSize = main.Size
+	end)
+
+	self:_connect(UserInputService.InputEnded, function(input)
+		if not dragging or not IsPress(input) then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Touch and input ~= dragInput then
+			return
+		end
+		dragging = false
+	end)
+
+	return grip
+end
+
+return BuildResizeGrip
 end
 
 modules["Window/Tab"] = function(...)
@@ -5117,6 +5348,33 @@ function Window:SetBlur(size)
 	self:_syncBlur()
 end
 
+-- the scale the window rests at: your UI scale, shrunk if it would not fit on the screen
+function Window:_scaleTarget()
+	if self._maximized then
+		return 1
+	end
+	local scale = math.clamp(self._userScale or 1, 0.6, 1.6)
+	local size = self._normalSize
+	local view = self.Gui.AbsoluteSize
+	if size and size.X.Offset > 0 and size.Y.Offset > 0 and view.X > 0 and view.Y > 0 then
+		scale = math.min(scale, (view.X - 12) / size.X.Offset, (view.Y - 12) / size.Y.Offset)
+	end
+	return math.max(scale, 0.4)
+end
+
+-- 0.6 to 1.6: makes the whole window (and its text) smaller or bigger
+function Window:SetScale(value)
+	self._userScale = math.clamp(value, 0.6, 1.6)
+	if self.Visible then
+		Tween(self._scale, { Scale = self:_scaleTarget() }, 0.2)
+	end
+	return self
+end
+
+function Window:GetScale()
+	return self._userScale or 1
+end
+
 function Window:SetVisible(visible)
 	visible = visible and true or false
 	self.Visible = visible
@@ -5128,14 +5386,15 @@ function Window:SetVisible(visible)
 	if visible then
 		self.Main.Visible = true
 		self.Main.GroupTransparency = 1
-		self._scale.Scale = 0.95
+		local target = self:_scaleTarget()
+		self._scale.Scale = 0.95 * target
 		Tween(self.Main, { GroupTransparency = 0 }, 0.2)
-		Tween(self._scale, { Scale = 1 }, 0.25, Enum.EasingStyle.Back)
+		Tween(self._scale, { Scale = target }, 0.25, Enum.EasingStyle.Back)
 	else
 		self._trayScale.Scale = 0.6
 		Tween(self._trayScale, { Scale = 1 }, 0.28, Enum.EasingStyle.Back)
 		Tween(self.Main, { GroupTransparency = 1 }, 0.14)
-		Tween(self._scale, { Scale = 0.95 }, 0.14)
+		Tween(self._scale, { Scale = 0.95 * self:_scaleTarget() }, 0.14)
 		task.delay(0.15, function()
 			if not self.Visible and self.Main.Parent then
 				self.Main.Visible = false

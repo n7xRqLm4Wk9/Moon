@@ -4,7 +4,7 @@ local import = ...
 
 local Moon = import("Core/Moon")
 local Services = import("Core/Services")
-local RunService = Services.RunService
+local RunService, Players = Services.RunService, Services.Players
 local Fonts = import("Core/Fonts")
 local FONT, FONT_BOLD = Fonts.FONT, Fonts.FONT_BOLD
 local Colors = import("Theme/Colors")
@@ -40,11 +40,35 @@ Moon.ESP = ESP
 local Object = {}
 Object.__index = Object
 
+-- where the overlays live: hidden UI first, then CoreGui, then PlayerGui (whichever accepts them)
 local function folder()
-	if not ESP._folder or not ESP._folder.Parent then
-		ESP._folder = Create("Folder", { Name = "MoonESP", Parent = GetGuiParent() })
+	if ESP._folder and ESP._folder.Parent then
+		return ESP._folder
 	end
-	return ESP._folder
+	local candidates = {
+		function()
+			return GetGuiParent()
+		end,
+		function()
+			return game:GetService("CoreGui")
+		end,
+		function()
+			return Players.LocalPlayer:WaitForChild("PlayerGui")
+		end,
+	}
+	for _, getParent in ipairs(candidates) do
+		local ok, result = pcall(function()
+			local made = Instance.new("Folder")
+			made.Name = "MoonESP"
+			made.Parent = getParent()
+			return made
+		end)
+		if ok and result and result.Parent then
+			ESP._folder = result
+			return result
+		end
+	end
+	error("[Moon.ESP] could not find a place to put the overlays")
 end
 
 local function rootOf(target)
@@ -116,7 +140,6 @@ function Object:_build(size)
 		AlwaysOnTop = true,
 		Size = UDim2.fromOffset(40, 60),
 		LightInfluence = 0,
-		ResetOnSpawn = false,
 		Active = false,
 		Enabled = false,
 		Parent = folder(),
@@ -154,15 +177,13 @@ function Object:_build(size)
 		StudsOffsetWorldSpace = Vector3.new(0, size.Y / 2 + 0.8, 0),
 		SizeOffset = Vector2.new(0, 0.5),
 		LightInfluence = 0,
-		ResetOnSpawn = false,
 		Active = false,
 		Enabled = false,
 		Parent = folder(),
 	})
-	self._group = Create("CanvasGroup", {
+	self._group = Create("Frame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
-		GroupTransparency = 1,
 		Parent = self.TagGui,
 	})
 	self._pop = Create("UIScale", { Parent = self._group })
@@ -300,9 +321,7 @@ function Object:_setShown(shown)
 		self._highlight.Enabled = shown and opt(self, "Highlight")
 	end
 	if shown then
-		self._group.GroupTransparency = 1
-		self._pop.Scale = 0.85
-		Tween(self._group, { GroupTransparency = 0 }, 0.25)
+		self._pop.Scale = 0.8
 		Tween(self._pop, { Scale = 1 }, 0.3, Enum.EasingStyle.Back)
 	end
 end
@@ -529,7 +548,19 @@ function ESP:Add(target, opts)
 		_low = false,
 		_conns = {},
 	}, Object)
-	object:_build(size)
+	local built, buildError = pcall(function()
+		object:_build(size)
+	end)
+	if not built then
+		warn("[Moon.ESP] could not build the overlay: " .. tostring(buildError))
+		if object.BoxGui then
+			object.BoxGui:Destroy()
+		end
+		if object.TagGui then
+			object.TagGui:Destroy()
+		end
+		return nil
+	end
 	object._name.Text = object.Name
 	table.insert(object._conns, target.AncestryChanged:Connect(function(_, parent)
 		if parent == nil then
@@ -580,6 +611,78 @@ function ESP:Configure(settings)
 		object:Refresh()
 	end
 	return ESP
+end
+
+-- Spawns a harmless local dummy in front of your camera so you can see the ESP working without
+-- any other players. Its health drops every couple of seconds. Remove it with ESP:StopDemo().
+function ESP:Demo()
+	ESP:StopDemo()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		warn("[Moon.ESP] no camera yet")
+		return nil
+	end
+	local look = camera.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+	local origin = camera.CFrame.Position + flat * 16
+	local facing = CFrame.new(origin, origin - flat)
+
+	local model = Instance.new("Model")
+	model.Name = "MoonDemoDummy"
+	local function part(name, size, offset, color)
+		local piece = Instance.new("Part")
+		piece.Name = name
+		piece.Size = size
+		piece.Anchored = true
+		piece.CanCollide = false
+		piece.CanQuery = false
+		piece.CanTouch = false
+		piece.Material = Enum.Material.SmoothPlastic
+		piece.Color = color
+		piece.CFrame = facing * CFrame.new(offset)
+		piece.Parent = model
+		return piece
+	end
+	local skin, shirt, pants = RGB(226, 190, 150), RGB(70, 90, 160), RGB(50, 54, 70)
+	local root = part("HumanoidRootPart", Vector3.new(2, 2, 1), Vector3.new(0, 0, 0), shirt)
+	part("Head", Vector3.new(1.4, 1.4, 1.4), Vector3.new(0, 1.9, 0), skin)
+	part("LeftArm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 0, 0), shirt)
+	part("RightArm", Vector3.new(1, 2, 1), Vector3.new(1.5, 0, 0), shirt)
+	part("LeftLeg", Vector3.new(1, 2, 1), Vector3.new(-0.5, -2, 0), pants)
+	part("RightLeg", Vector3.new(1, 2, 1), Vector3.new(0.5, -2, 0), pants)
+	model.PrimaryPart = root
+	model.Parent = workspace
+
+	local object = ESP:Add(model, {
+		Name = "Dummy",
+		Health = 100,
+		MaxHealth = 100,
+		Lines = { "Moon demo", "Takes damage" },
+	})
+	ESP._demo = model
+	task.spawn(function()
+		local health = 100
+		while ESP._demo == model and model.Parent do
+			task.wait(1.6)
+			health = health - 20
+			if health < 0 then
+				health = 100
+			end
+			if object and ESP._objects[model] == object then
+				object:SetHealth(health, 100)
+			end
+		end
+	end)
+	return object
+end
+
+function ESP:StopDemo()
+	local model = ESP._demo
+	ESP._demo = nil
+	if model then
+		model:Destroy()
+	end
 end
 
 return ESP

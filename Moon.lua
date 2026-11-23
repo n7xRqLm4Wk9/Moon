@@ -51,6 +51,7 @@ local MODULES = {
 	"Window/Notify",
 	"Window/OpenButton",
 	"Window/PlayerCard",
+	"Window/ResizeGrip",
 	"Window/Tab",
 	"Window/Watermark",
 	"Window/Window",

@@ -74,6 +74,35 @@ function Elements:AddAccentPicker(opts)
 end
 
 -- Ready-made slider for the background blur strength
+-- Ready-made slider that scales the whole window (handy on small phones).
+-- The window resizes a moment after you let go, so the slider does not move under your finger.
+function Elements:AddScaleSlider(opts)
+	opts = opts or {}
+	local window = self.Window
+	local userCallback = opts.Callback
+	local token = 0
+	return self:AddSlider({
+		Name = opts.Name or "UI scale",
+		Description = opts.Description or "Bigger or smaller window",
+		Min = 60,
+		Max = 160,
+		Increment = 5,
+		Suffix = "%",
+		Default = math.floor(window:GetScale() * 100 + 0.5),
+		Flag = opts.Flag or "UI.Scale",
+		Callback = function(value)
+			token = token + 1
+			local mine = token
+			task.delay(0.35, function()
+				if token == mine then
+					window:SetScale(value / 100)
+				end
+			end)
+			Safe(userCallback, value)
+		end,
+	})
+end
+
 function Elements:AddBlurSlider(opts)
 	opts = opts or {}
 	local window = self.Window

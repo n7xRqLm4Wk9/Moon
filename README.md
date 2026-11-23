@@ -90,10 +90,23 @@ local Window = Moon:CreateWindow({
     Blur = true,                          -- true, false, or a number 0-30 (background blur strength)
     PlayerCard = true,                    -- bottom-left card with avatar, name and playtime
     Watermark = true,                     -- FPS + ping card (false starts it hidden)
+    Scale = 1,                            -- UI scale, 0.6 to 1.6 (see Size and scale)
 })
 ```
 
 Other options: `Size` (UDim2), `NavWidth` (number), `Parent` (Instance).
+
+## Size and scale
+
+- **Resize:** drag the dotted grip in the bottom-right corner of the window (minimum 380x270). It does not appear while the window is maximized.
+- **UI scale:** makes the whole window and its text bigger or smaller, which helps on small phones. It never grows past what fits on screen.
+
+```lua
+Window:SetScale(1.2)         -- 0.6 to 1.6
+print(Window:GetScale())
+
+Look:AddScaleSlider()        -- ready-made slider (the window resizes a moment after you let go)
+```
 
 ## Tabs
 
@@ -261,6 +274,7 @@ local Look = Settings:AddSection("Appearance")
 Look:AddThemeDropdown()      -- every registered theme, fades smoothly
 Look:AddAccentPicker()       -- color picker that recolors the whole UI live
 Look:AddBlurSlider()         -- background blur strength
+Look:AddScaleSlider()        -- UI scale
 Look:AddWatermarkToggle()    -- show/hide the FPS + ping card
 ```
 
@@ -394,6 +408,15 @@ Ready-made controls for your menu (toggles, box style, max distance, color):
 ```lua
 Visuals:AddSection("ESP"):AddESPControls()
 ```
+
+No other players to test with? Spawn a test dummy in front of your camera (its health drops every couple of seconds):
+
+```lua
+Moon.ESP:Demo()
+Moon.ESP:StopDemo()
+```
+
+If an overlay cannot be built, Moon prints a `[Moon.ESP]` warning in the console with the reason.
 
 Low health makes the bar pulse red. Overlays fade in and out, and they are removed automatically when the target is destroyed.
 

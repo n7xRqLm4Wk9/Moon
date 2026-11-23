@@ -56,6 +56,33 @@ function Window:SetBlur(size)
 	self:_syncBlur()
 end
 
+-- the scale the window rests at: your UI scale, shrunk if it would not fit on the screen
+function Window:_scaleTarget()
+	if self._maximized then
+		return 1
+	end
+	local scale = math.clamp(self._userScale or 1, 0.6, 1.6)
+	local size = self._normalSize
+	local view = self.Gui.AbsoluteSize
+	if size and size.X.Offset > 0 and size.Y.Offset > 0 and view.X > 0 and view.Y > 0 then
+		scale = math.min(scale, (view.X - 12) / size.X.Offset, (view.Y - 12) / size.Y.Offset)
+	end
+	return math.max(scale, 0.4)
+end
+
+-- 0.6 to 1.6: makes the whole window (and its text) smaller or bigger
+function Window:SetScale(value)
+	self._userScale = math.clamp(value, 0.6, 1.6)
+	if self.Visible then
+		Tween(self._scale, { Scale = self:_scaleTarget() }, 0.2)
+	end
+	return self
+end
+
+function Window:GetScale()
+	return self._userScale or 1
+end
+
 function Window:SetVisible(visible)
 	visible = visible and true or false
 	self.Visible = visible
@@ -67,14 +94,15 @@ function Window:SetVisible(visible)
 	if visible then
 		self.Main.Visible = true
 		self.Main.GroupTransparency = 1
-		self._scale.Scale = 0.95
+		local target = self:_scaleTarget()
+		self._scale.Scale = 0.95 * target
 		Tween(self.Main, { GroupTransparency = 0 }, 0.2)
-		Tween(self._scale, { Scale = 1 }, 0.25, Enum.EasingStyle.Back)
+		Tween(self._scale, { Scale = target }, 0.25, Enum.EasingStyle.Back)
 	else
 		self._trayScale.Scale = 0.6
 		Tween(self._trayScale, { Scale = 1 }, 0.28, Enum.EasingStyle.Back)
 		Tween(self.Main, { GroupTransparency = 1 }, 0.14)
-		Tween(self._scale, { Scale = 0.95 }, 0.14)
+		Tween(self._scale, { Scale = 0.95 * self:_scaleTarget() }, 0.14)
 		task.delay(0.15, function()
 			if not self.Visible and self.Main.Parent then
 				self.Main.Visible = false

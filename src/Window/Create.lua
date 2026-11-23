@@ -7,6 +7,7 @@ local Window = import("Window/Window")
 local BuildWatermark = import("Window/Watermark")
 local BuildPlayerCard = import("Window/PlayerCard")
 local BuildOpenButton = import("Window/OpenButton")
+local BuildResizeGrip = import("Window/ResizeGrip")
 local Services = import("Core/Services")
 local Players, UserInputService, Lighting, RunService, GuiService = Services.Players, Services.UserInputService, Services.Lighting, Services.RunService, Services.GuiService
 local Fonts = import("Core/Fonts")
@@ -115,6 +116,8 @@ function Moon:CreateWindow(opts)
 	self.Main = main
 	local scale = Create("UIScale", { Parent = main })
 	self._scale = scale
+	self._userScale = opts.Scale or 1
+	self._normalSize = size
 
 	-- soft colored sheen across the glass (fades from top-left to transparent)
 	local sheen = Create("Frame", {
@@ -343,18 +346,27 @@ function Moon:CreateWindow(opts)
 	-- open button (draggable, shown while the window is hidden)
 	BuildOpenButton(self, overlay, opts)
 
+	-- resize grip (bottom-right corner)
+	self._grip = BuildResizeGrip(self, main)
+
 	-- maximize / restore
 	local maximized = false
 	local restoreSize, restorePos = size, main.Position
 	maxBtn.MouseButton1Click:Connect(function()
 		maximized = not maximized
+		self._maximized = maximized
 		if maximized then
 			restoreSize, restorePos = main.Size, main.Position
 			mainCorner.CornerRadius = UDim.new(0, 0)
 			Tween(main, { Size = UDim2.fromScale(1, 1), Position = UDim2.fromScale(0.5, 0.5) }, 0.22)
 		else
 			mainCorner.CornerRadius = UDim.new(0, 8)
+			self._normalSize = restoreSize
 			Tween(main, { Size = restoreSize, Position = restorePos }, 0.22)
+		end
+		Tween(scale, { Scale = self:_scaleTarget() }, 0.22)
+		if self._grip then
+			self._grip.Visible = not maximized
 		end
 	end)
 	minBtn.MouseButton1Click:Connect(function()
@@ -399,9 +411,10 @@ function Moon:CreateWindow(opts)
 	-- intro animation
 	self:_syncBlur()
 	main.GroupTransparency = 1
-	scale.Scale = 0.95
+	local introScale = self:_scaleTarget()
+	scale.Scale = 0.95 * introScale
 	Tween(main, { GroupTransparency = 0 }, 0.28)
-	Tween(scale, { Scale = 1 }, 0.32, Enum.EasingStyle.Back)
+	Tween(scale, { Scale = introScale }, 0.32, Enum.EasingStyle.Back)
 
 	table.insert(Moon.Windows, self)
 	return self

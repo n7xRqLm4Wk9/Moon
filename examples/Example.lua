@@ -91,14 +91,13 @@ Demo:AddButton({
 	end,
 })
 Demo:AddToggle({
-	Name = "ESP on me",
-	Description = "Preview the overlay on your own character",
+	Name = "ESP demo dummy",
+	Description = "Spawns a test dummy in front of you (turn the ESP switch on above)",
 	Callback = function(on)
-		local character = game:GetService("Players").LocalPlayer.Character
-		if on and character then
-			Moon.ESP:Add(character, { Name = "You", Health = 100, MaxHealth = 100, Lines = { "ESP preview" } })
-		elseif character then
-			Moon.ESP:Remove(character)
+		if on then
+			Moon.ESP:Demo()
+		else
+			Moon.ESP:StopDemo()
 		end
 	end,
 })
@@ -107,6 +106,7 @@ local Look = Settings:AddSection("Appearance")
 Look:AddThemeDropdown() -- every registered theme, fades smoothly
 Look:AddAccentPicker() -- recolors the whole UI live
 Look:AddBlurSlider() -- background blur strength
+Look:AddScaleSlider() -- bigger or smaller window
 Look:AddWatermarkToggle() -- FPS + ping card
 
 local Configs = Settings:AddSection("Configs")
