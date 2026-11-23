@@ -39,7 +39,8 @@ Moon/
     │   ├── Moon.lua             the shared library table (Flags, Windows, Themes)
     │   ├── Services.lua         Roblox services
     │   ├── Fonts.lua            fonts with fallbacks
-    │   └── Util.lua             Create, Tween, Corner, input helpers, ...
+    │   ├── Util.lua             Create, Tween, Corner, input helpers, ...
+    │   └── Config.lua           save, load and auto-load configs
     ├── Theme/
     │   ├── Colors.lua           color math
     │   ├── Registry.lua         builds full themes from a few colors, registers and resolves them
@@ -49,6 +50,7 @@ Moon/
     │   ├── Logo.lua             the moon logo
     │   ├── Card.lua             settings card used by every element
     │   └── Elements/            Button, Toggle, Slider, Dropdown, Textbox, Keybind, ColorPicker, ...
+    │                            Track.lua (remembers flagged elements) and Config.lua (config panel)
     └── Window/
         ├── Window.lua           visibility, blur, theme switching, cleanup
         ├── Create.lua           Moon:CreateWindow
@@ -58,6 +60,8 @@ Moon/
         ├── PlayerCard.lua       avatar, name, session playtime
         └── OpenButton.lua       draggable open button
 ```
+
+Optional extras live in `src/Extras/` (`ESP/`, `TargetCard.lua`, `Visuals/`) and only run when you `Moon:Use(...)` them.
 
 Every file starts with `local import = ...` and returns what it exports. `import("Core/Util")` loads `src/Core/Util.lua` once and caches it.
 
@@ -204,6 +208,10 @@ print(Moon.Flags.EspColor)
 
 Click the row (or the swatch) to open it: a saturation/brightness square, a hue bar, a hex box (`#RRGGBB`) and preset colors. Pass your own with `Presets = { Color3.new(1, 0, 0), ... }`.
 
+### Dropdowns
+
+The option list opens as a floating popup. On PC it sits under the box (or above it when there is no room) and closes when you scroll. On phones it opens as a centered sheet with a dim backdrop and large rows, so it never fights the page for scrolling.
+
 ## Themes
 
 Built in: `Moon` (default, dark), `MoonLight`, `Claude`, `ClaudeLight`.
@@ -295,6 +303,149 @@ Moon:Unload()            -- removes every window
 ```
 
 The title bar has minimize, maximize and close buttons. Minimize hides the window and shows a small open button with the moon logo. Hold and drag that button anywhere on the screen, and tap it to bring the window back. The toggle key does the same on PC.
+
+## Config saving
+
+Every element that has a `Flag` is saved: toggles, sliders, dropdowns, textboxes, keybinds and color pickers (including the theme and accent from the appearance helpers). Configs are JSON files in your executor workspace: `Moon/configs/<name>.json`.
+
+### Ready-made panel
+
+```lua
+local Configs = Settings:AddSection("Configs")
+Configs:AddConfigManager()
+```
+
+It adds a config dropdown, a name box, Save / Load / Delete buttons, and **Auto load** and **Auto save** toggles. Loading a config sets every saved element and fires its callback, so your features switch on or off the same way they would if you clicked them.
+
+### From code
+
+```lua
+Moon:SetFolder("MoonHub")          -- optional: configs go to MoonHub/configs/ (default "Moon")
+
+Moon:SaveConfig("legit")           -- returns true or false, error
+Moon:LoadConfig("legit")           -- returns true, appliedCount or false, error
+Moon:DeleteConfig("legit")
+print(Moon:ListConfigs())          -- { "legit", "rage" }
+
+Moon:SetAutoLoad("legit")          -- remembered between runs (nil to turn it off)
+Moon:SetAutoSave(true, "legit")    -- saves 1.5s after any change
+
+Moon:LoadAutoConfig()              -- put this at the END of your script
+```
+
+`LoadAutoConfig` has to run after your UI is built, because it can only set elements that already exist. Elements without a `Flag` are never saved, so give every setting you want to keep one:
+
+```lua
+Player:AddToggle({ Name = "Enabled", Flag = "Enabled" })
+```
+
+Saving needs an executor with `writefile`, `readfile` and `isfile`. Without them `SaveConfig` returns `false, "this executor has no file access"` and nothing breaks.
+
+## Extras (optional)
+
+Extras are not loaded unless you ask for them:
+
+```lua
+Moon:Use("ESP")
+Moon:Use({ "ESP", "TargetCard", "Visuals" })
+```
+
+Moon never looks for players or reads their health for you. You decide what to show and set the values; Moon draws it and animates the changes.
+
+### ESP
+
+Overlays for any Model or part: a box (corners or full), name, health bar, distance, extra info lines and an optional glow outline.
+
+```lua
+local esp = Moon.ESP:Add(character, {
+    Name = "Enemy",
+    Health = 100,
+    MaxHealth = 100,
+    Lines = { "Team: Red", "AK-47" },
+    Color = Color3.fromRGB(255, 120, 120),   -- optional, per object
+})
+
+esp:SetHealth(60)             -- bar animates, a white trail catches up, name flashes red
+esp:SetName("Boss")
+esp:SetLines({ "Team: Blue" })
+esp:SetColor(Color3.new(1, 0, 0))
+esp:SetDistance(123)          -- optional: show your own number instead of the real distance
+esp:SetVisible(false)
+esp:BindHumanoid(humanoid)    -- optional: keep health in sync automatically
+esp:Set({ Name = "Bot", Health = 80, Box = false })   -- several things at once
+esp:Destroy()
+```
+
+Global controls:
+
+```lua
+Moon.ESP:SetEnabled(false)                 -- master switch
+Moon.ESP:Configure({ Box = true, BoxStyle = "Full", Name = true, Health = true, HealthText = true,
+                     Distance = true, Lines = true, Highlight = false, MaxDistance = 800,
+                     Unit = "m", Color = Color3.fromRGB(184, 196, 240) })
+Moon.ESP:Remove(character)
+Moon.ESP:Clear()
+```
+
+Ready-made controls for your menu (toggles, box style, max distance, color):
+
+```lua
+Visuals:AddSection("ESP"):AddESPControls()
+```
+
+Low health makes the bar pulse red. Overlays fade in and out, and they are removed automatically when the target is destroyed.
+
+### Target card
+
+A glass card with a player's face, name, health bar and info chips. It slides in, the health number counts, damage shakes the card and flashes the border, and low health pulses the ring.
+
+```lua
+local card = Window:CreateTargetCard({ Position = "TopCenter" })   -- TopCenter, TopLeft, TopRight, BottomCenter
+
+card:SetTarget({
+    Name = "Enemy",
+    Sub = "@enemy123",
+    UserId = 1234567,            -- loads that player's face (or use Image = "rbxassetid://...")
+    Health = 100,
+    MaxHealth = 100,
+    Info = { "Team: Red", "AK-47", "42m" },
+}):Show()
+
+card:SetHealth(60)               -- animated
+card:SetPlayer(player)           -- fills name, @username and face from a Player
+card:SetInfo({ "Reloading" })
+card:BindHumanoid(humanoid)      -- optional: keep health in sync automatically
+card:Hide()
+card:Destroy()
+```
+
+The card sits in the safe area, so it never covers the Roblox top bar.
+
+### Visuals
+
+Lighting and post-processing presets that blend in smoothly. `Reset` puts the game back exactly as it was.
+
+```lua
+Moon.Visuals:Apply("Cinematic")      -- Cinematic, Vivid, Soft Glow, Moonlight, Warm Sunset, Noir
+Moon.Visuals:Set("Bloom", { Intensity = 1.2 })
+Moon.Visuals:Set("Lighting", { ClockTime = 20 })
+Moon.Visuals:Set("Camera", { FieldOfView = 90 })
+Moon.Visuals:Reset()
+
+Moon.Visuals:AddPreset("Mine", {
+    Bloom = { Intensity = 0.7, Size = 30, Threshold = 1 },
+    ColorCorrection = { Contrast = 0.1, Saturation = 0.2 },
+    Lighting = { ClockTime = 18 },
+})
+```
+
+Effects: `Bloom`, `ColorCorrection`, `SunRays`, `DepthOfField`, `Atmosphere`, plus `Lighting` and `Camera` properties. Ready-made controls (preset dropdown, bloom, contrast, saturation, brightness, sun rays, depth of field, time of day, field of view, tint, reset):
+
+```lua
+Settings:AddSection("Visuals"):AddVisualsControls()
+```
+
+All of these controls have Flags, so config saving remembers them.
 
 ## Adding your own element
 

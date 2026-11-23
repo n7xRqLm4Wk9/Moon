@@ -10,7 +10,7 @@ local FONT, FONT_MED = Fonts.FONT, Fonts.FONT_MED
 local Colors = import("Theme/Colors")
 local WHITE, BLACK, RGB, ToHex, FromHex = Colors.WHITE, Colors.BLACK, Colors.RGB, Colors.ToHex, Colors.FromHex
 local Util = import("Core/Util")
-local Create, Tween, Corner, Safe, SetFlag, IsPress, IsMove = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.SetFlag, Util.IsPress, Util.IsMove
+local Create, Tween, Corner, Safe, SetFlag, IsPress, IsMove, ScrollIntoView = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.SetFlag, Util.IsPress, Util.IsMove, Util.ScrollIntoView
 local Binding = import("Theme/Binding")
 local Themed, NewText, Stroke = Binding.Themed, Binding.NewText, Binding.Stroke
 
@@ -278,6 +278,9 @@ function Elements:AddColorPicker(opts)
 	local function toggle(state)
 		open = state
 		Tween(card, { Size = UDim2.new(1, 0, 0, open and (rowH + panelH) or rowH) }, 0.24)
+		if open and self.Page then
+			ScrollIntoView(self.Page, card)
+		end
 	end
 	rowButton.MouseButton1Click:Connect(function()
 		toggle(not open)

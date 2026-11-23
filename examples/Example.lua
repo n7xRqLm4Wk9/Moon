@@ -5,6 +5,9 @@ local Moon = loadstring(game:HttpGet("https://raw.githubusercontent.com/n7xRqLm4
 -- optional themes: load all of them, or pass a list like { "Midnight", "Eclipse" }
 Moon:AddThemes()
 
+-- optional extras: only loaded when you ask for them
+Moon:Use({ "ESP", "TargetCard", "Visuals" })
+
 local Window = Moon:CreateWindow({
 	Title = "Moon",
 	Subtitle = "example",
@@ -15,6 +18,7 @@ local Window = Moon:CreateWindow({
 
 local General = Window:AddTab("General")
 local Visuals = Window:AddTab("Visuals")
+local Extras = Window:AddTab("Extras")
 local Settings = Window:AddTab("Settings")
 
 local Player = General:AddSection("Player")
@@ -48,10 +52,67 @@ Overlay:AddButton({
 	end,
 })
 
+-- ready-made ESP and visuals controls
+Extras:AddSection("ESP"):AddESPControls()
+Extras:AddSection("Visuals"):AddVisualsControls()
+
+-- enemy card + ESP demo: YOU provide the data, Moon draws and animates it
+local card = Window:CreateTargetCard({ Position = "TopCenter" })
+local enemy = { Health = 100 }
+local Demo = Extras:AddSection("Demo")
+Demo:AddButton({
+	Name = "Show enemy card",
+	ButtonText = "Show",
+	Callback = function()
+		enemy.Health = 100
+		card:SetTarget({
+			Name = "Enemy",
+			Sub = "@builderman",
+			UserId = 156,
+			Health = 100,
+			MaxHealth = 100,
+			Info = { "Team: Red", "AK-47", "42m" },
+		}):Show()
+	end,
+})
+Demo:AddButton({
+	Name = "Take damage",
+	ButtonText = "-25",
+	Callback = function()
+		enemy.Health = math.max(0, enemy.Health - 25)
+		card:SetHealth(enemy.Health)
+	end,
+})
+Demo:AddButton({
+	Name = "Hide card",
+	ButtonText = "Hide",
+	Callback = function()
+		card:Hide()
+	end,
+})
+Demo:AddToggle({
+	Name = "ESP on me",
+	Description = "Preview the overlay on your own character",
+	Callback = function(on)
+		local character = game:GetService("Players").LocalPlayer.Character
+		if on and character then
+			Moon.ESP:Add(character, { Name = "You", Health = 100, MaxHealth = 100, Lines = { "ESP preview" } })
+		elseif character then
+			Moon.ESP:Remove(character)
+		end
+	end,
+})
+
 local Look = Settings:AddSection("Appearance")
 Look:AddThemeDropdown() -- every registered theme, fades smoothly
 Look:AddAccentPicker() -- recolors the whole UI live
 Look:AddBlurSlider() -- background blur strength
 Look:AddWatermarkToggle() -- FPS + ping card
 
+local Configs = Settings:AddSection("Configs")
+Configs:AddConfigManager() -- save, load, delete, auto load, auto save
+
 print(Moon.Flags.Enabled, Moon.Flags.Speed)
+
+-- keep this LAST: applies the config you marked "Auto load" (after every element exists)
+Moon:LoadAutoConfig()

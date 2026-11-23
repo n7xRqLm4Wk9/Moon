@@ -11,5 +11,7 @@ import("UI/Elements/Textbox")
 import("UI/Elements/Keybind")
 import("UI/Elements/ColorPicker")
 import("UI/Elements/Helpers")
+import("UI/Elements/Track")
+import("UI/Elements/Config")
 
 return import("UI/Elements/Base")

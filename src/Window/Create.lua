@@ -333,6 +333,7 @@ function Moon:CreateWindow(opts)
 			return GuiService:GetGuiInset()
 		end)
 		local top = ok and inset.Y or 0
+		self._topInset = top
 		self.Watermark.Instance.Position = UDim2.new(1, -12, 0, 12 + top)
 		if isTouch then
 			notifyHolder.Position = UDim2.new(1, -12, 0, 58 + top)
@@ -412,6 +413,7 @@ function Moon:Unload()
 		window:Destroy()
 	end
 	table.clear(Moon.Flags)
+	table.clear(Moon._elements)
 end
 
 return Moon

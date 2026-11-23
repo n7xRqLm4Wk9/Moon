@@ -61,6 +61,9 @@ function Window:SetVisible(visible)
 	self.Visible = visible
 	self._tray.Visible = not visible
 	self:_syncBlur()
+	if not visible and self._closePopup then
+		self._closePopup()
+	end
 	if visible then
 		self.Main.Visible = true
 		self.Main.GroupTransparency = 1

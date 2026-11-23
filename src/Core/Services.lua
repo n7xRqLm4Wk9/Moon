@@ -9,4 +9,5 @@ return {
 	RunService = game:GetService("RunService"),
 	GuiService = game:GetService("GuiService"),
 	Stats = game:GetService("Stats"),
+	HttpService = game:GetService("HttpService"),
 }

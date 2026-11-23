@@ -4,6 +4,294 @@
 
 local modules = {}
 
+modules["Core/Config"] = function(...)
+-- Config saving: stores every element that has a Flag (toggles, sliders, dropdowns, textboxes,
+-- keybinds, color pickers) as JSON in the executor workspace, and applies it back later.
+local import = ...
+
+local Moon = import("Core/Moon")
+local Services = import("Core/Services")
+local HttpService = Services.HttpService
+
+local VERSION = 1
+
+-- these flags are applied first, so a saved accent color wins over the saved theme
+local PRIORITY = { Theme = 1, Accent = 2 }
+
+local function clean(name)
+	name = tostring(name or "")
+	name = string.gsub(name, "[^%w _%-]", "")
+	return (string.match(name, "^%s*(.-)%s*$"))
+end
+
+local function folder()
+	return Moon.ConfigFolder .. "/configs"
+end
+
+local function pathOf(name)
+	return folder() .. "/" .. name .. ".json"
+end
+
+local function autoloadPath()
+	return Moon.ConfigFolder .. "/autoload.txt"
+end
+
+local function ensureFolders()
+	if not (makefolder and isfolder) then
+		return
+	end
+	pcall(function()
+		if not isfolder(Moon.ConfigFolder) then
+			makefolder(Moon.ConfigFolder)
+		end
+		if not isfolder(folder()) then
+			makefolder(folder())
+		end
+	end)
+end
+
+-- values -> json-safe tables ------------------------------------------------
+
+local function encode(value)
+	local kind = typeof(value)
+	if kind == "boolean" or kind == "number" or kind == "string" then
+		return value
+	elseif kind == "Color3" then
+		return { __t = "Color3", v = { value.R, value.G, value.B } }
+	elseif kind == "EnumItem" then
+		local enumName = string.gsub(tostring(value.EnumType), "^Enum%.", "")
+		return { __t = "Enum", e = enumName, n = value.Name }
+	elseif kind == "table" then
+		local out = {}
+		for k, v in pairs(value) do
+			local encoded = encode(v)
+			if encoded ~= nil then
+				out[k] = encoded
+			end
+		end
+		return out
+	end
+	return nil
+end
+
+local function decode(value)
+	if type(value) ~= "table" then
+		return value
+	end
+	if value.__t == "Color3" and type(value.v) == "table" then
+		return Color3.new(value.v[1], value.v[2], value.v[3])
+	elseif value.__t == "Enum" then
+		local ok, item = pcall(function()
+			return Enum[value.e][value.n]
+		end)
+		return ok and item or nil
+	end
+	local out = {}
+	for k, v in pairs(value) do
+		out[k] = decode(v)
+	end
+	return out
+end
+
+-- public api ----------------------------------------------------------------
+
+-- where configs live: <folder>/configs/<name>.json (default folder: "Moon")
+function Moon:SetFolder(name)
+	local cleaned = clean(name)
+	Moon.ConfigFolder = cleaned ~= "" and cleaned or "Moon"
+	return Moon
+end
+
+function Moon:ConfigsSupported()
+	return writefile ~= nil and readfile ~= nil and isfile ~= nil
+end
+
+-- returns ok, nameOrError
+function Moon:SaveConfig(name)
+	name = clean(name)
+	if name == "" then
+		return false, "enter a config name"
+	end
+	if not Moon:ConfigsSupported() then
+		return false, "this executor has no file access"
+	end
+	ensureFolders()
+	local flags = {}
+	for flag, value in pairs(Moon.Flags) do
+		local encoded = encode(value)
+		if encoded ~= nil then
+			flags[flag] = encoded
+		end
+	end
+	local encodedOk, json = pcall(function()
+		return HttpService:JSONEncode({ version = VERSION, flags = flags })
+	end)
+	if not encodedOk then
+		return false, "could not encode the config"
+	end
+	local wrote, err = pcall(writefile, pathOf(name), json)
+	if not wrote then
+		return false, tostring(err)
+	end
+	Moon._currentConfig = name
+	return true, name
+end
+
+-- applies a saved config to the elements on screen; returns ok, appliedCountOrError
+function Moon:LoadConfig(name)
+	name = clean(name)
+	if name == "" then
+		return false, "pick a config"
+	end
+	if not Moon:ConfigsSupported() or not isfile(pathOf(name)) then
+		return false, "config not found"
+	end
+	local readOk, content = pcall(readfile, pathOf(name))
+	if not readOk then
+		return false, "could not read the file"
+	end
+	local decodedOk, data = pcall(function()
+		return HttpService:JSONDecode(content)
+	end)
+	if not decodedOk or type(data) ~= "table" or type(data.flags) ~= "table" then
+		return false, "config file is corrupted"
+	end
+
+	local keys = {}
+	for flag in pairs(data.flags) do
+		table.insert(keys, flag)
+	end
+	table.sort(keys, function(a, b)
+		local pa, pb = PRIORITY[a] or 99, PRIORITY[b] or 99
+		if pa ~= pb then
+			return pa < pb
+		end
+		return a < b
+	end)
+
+	local applied = 0
+	Moon._loading = true
+	local loopOk, loopErr = pcall(function()
+		for _, flag in ipairs(keys) do
+			local element = Moon._elements[flag]
+			local value = decode(data.flags[flag])
+			if element and value ~= nil then
+				local ok, err = pcall(element.Set, element, value)
+				if ok then
+					applied = applied + 1
+				else
+					warn("[Moon] could not apply '" .. flag .. "': " .. tostring(err))
+				end
+			end
+		end
+	end)
+	Moon._loading = false
+	if not loopOk then
+		return false, tostring(loopErr)
+	end
+
+	Moon._currentConfig = name
+	return true, applied
+end
+
+function Moon:DeleteConfig(name)
+	name = clean(name)
+	if not (isfile and delfile) or not isfile(pathOf(name)) then
+		return false, "config not found"
+	end
+	local ok, err = pcall(delfile, pathOf(name))
+	if not ok then
+		return false, tostring(err)
+	end
+	if Moon:GetAutoLoad() == name then
+		Moon:SetAutoLoad(nil)
+	end
+	if Moon._currentConfig == name then
+		Moon._currentConfig = nil
+	end
+	return true
+end
+
+function Moon:ListConfigs()
+	local names = {}
+	if not (listfiles and isfolder) or not isfolder(folder()) then
+		return names
+	end
+	local ok, files = pcall(listfiles, folder())
+	if ok and type(files) == "table" then
+		for _, path in ipairs(files) do
+			local name = string.match(tostring(path), "([^/\\]+)%.json$")
+			if name then
+				table.insert(names, name)
+			end
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+-- auto load: call Moon:LoadAutoConfig() at the END of your script, after the UI is built
+function Moon:SetAutoLoad(name)
+	if not Moon:ConfigsSupported() then
+		return false
+	end
+	ensureFolders()
+	local cleaned = name ~= nil and clean(name) or ""
+	if cleaned == "" then
+		if delfile and isfile(autoloadPath()) then
+			pcall(delfile, autoloadPath())
+		end
+	else
+		pcall(writefile, autoloadPath(), cleaned)
+	end
+	return true
+end
+
+function Moon:GetAutoLoad()
+	if not (isfile and readfile) or not isfile(autoloadPath()) then
+		return nil
+	end
+	local ok, content = pcall(readfile, autoloadPath())
+	local name = ok and clean(content) or ""
+	if name ~= "" and isfile(pathOf(name)) then
+		return name
+	end
+	return nil
+end
+
+function Moon:LoadAutoConfig()
+	local name = Moon:GetAutoLoad()
+	if not name then
+		return false, "no auto load config set"
+	end
+	return Moon:LoadConfig(name)
+end
+
+-- auto save: saves to the current config (the last one saved or loaded) 1.5s after a change
+function Moon:SetAutoSave(enabled, name)
+	Moon._autoSave = enabled and true or false
+	if name and clean(name) ~= "" then
+		Moon._currentConfig = clean(name)
+	end
+	return Moon
+end
+
+Moon._onFlag = function()
+	if Moon._loading or not Moon._autoSave or not Moon._currentConfig then
+		return
+	end
+	local token = (Moon._saveToken or 0) + 1
+	Moon._saveToken = token
+	task.delay(1.5, function()
+		if Moon._saveToken == token and Moon._autoSave and Moon._currentConfig then
+			Moon:SaveConfig(Moon._currentConfig)
+		end
+	end)
+end
+
+return Moon
+end
+
 modules["Core/Fonts"] = function(...)
 -- Fonts (with fallbacks for older clients).
 local import = ...
@@ -38,11 +326,13 @@ local import = ...
 
 return {
 	Name = "Moon",
-	Version = "1.0.0",
+	Version = "1.1.0",
 	Flags = {},
 	Windows = {},
 	Themes = {},
 	ExtraThemes = {},
+	ConfigFolder = "Moon",
+	_elements = {},
 	_order = {},
 	_extraOrder = {},
 }
@@ -60,12 +350,15 @@ return {
 	RunService = game:GetService("RunService"),
 	GuiService = game:GetService("GuiService"),
 	Stats = game:GetService("Stats"),
+	HttpService = game:GetService("HttpService"),
 }
 end
 
 modules["Core/Util"] = function(...)
 -- General helpers: instance creation, tweens, layout shortcuts, input helpers.
 local import = ...
+
+local UserInputService = import("Core/Services").UserInputService
 
 local Moon = import("Core/Moon")
 local Services = import("Core/Services")
@@ -148,6 +441,9 @@ end
 local function SetFlag(opts, value)
 	if opts.Flag then
 		Moon.Flags[opts.Flag] = value
+		if Moon._onFlag then
+			Moon._onFlag(opts.Flag)
+		end
 	end
 end
 
@@ -171,7 +467,27 @@ local function GetGuiParent()
 	return Players.LocalPlayer:WaitForChild("PlayerGui")
 end
 
+-- true when the last thing the player used was a touchscreen
+local function IsTouchInput()
+	return UserInputService:GetLastInputType() == Enum.UserInputType.Touch
+end
+
+-- scrolls `page` so `target` is fully visible (used after a card expands near the bottom)
+local function ScrollIntoView(page, target)
+	task.delay(0.26, function()
+		if not (page.Parent and target.Parent) then
+			return
+		end
+		local overflow = (target.AbsolutePosition.Y + target.AbsoluteSize.Y) - (page.AbsolutePosition.Y + page.AbsoluteSize.Y) + 12
+		if overflow > 0 then
+			Tween(page, { CanvasPosition = Vector2.new(0, page.CanvasPosition.Y + overflow) }, 0.2)
+		end
+	end)
+end
+
 return {
+	IsTouchInput = IsTouchInput,
+	ScrollIntoView = ScrollIntoView,
 	Create = Create,
 	Tween = Tween,
 	Apply = Apply,
@@ -186,6 +502,1597 @@ return {
 }
 end
 
+modules["Extras/ESP/Controls"] = function(...)
+-- Ready-made controls for the ESP: drop them into any tab or section.
+local import = ...
+
+local Elements = import("UI/Elements/Base")
+local ESP = import("Extras/ESP/ESP")
+
+function Elements:AddESPControls()
+	local settings = ESP.Settings
+
+	self:AddToggle({
+		Name = "ESP",
+		Description = "Master switch for every ESP object",
+		Default = ESP.Enabled,
+		Flag = "ESP.Enabled",
+		Callback = function(value)
+			ESP:SetEnabled(value)
+		end,
+	})
+	self:AddToggle({
+		Name = "Boxes",
+		Default = settings.Box,
+		Flag = "ESP.Box",
+		Callback = function(value)
+			ESP:Configure({ Box = value })
+		end,
+	})
+	self:AddDropdown({
+		Name = "Box style",
+		Options = { "Corners", "Full" },
+		Default = settings.BoxStyle,
+		Flag = "ESP.BoxStyle",
+		Callback = function(value)
+			ESP:Configure({ BoxStyle = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Names",
+		Default = settings.Name,
+		Flag = "ESP.Name",
+		Callback = function(value)
+			ESP:Configure({ Name = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Health bars",
+		Default = settings.Health,
+		Flag = "ESP.Health",
+		Callback = function(value)
+			ESP:Configure({ Health = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Health numbers",
+		Default = settings.HealthText,
+		Flag = "ESP.HealthText",
+		Callback = function(value)
+			ESP:Configure({ HealthText = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Distance",
+		Default = settings.Distance,
+		Flag = "ESP.Distance",
+		Callback = function(value)
+			ESP:Configure({ Distance = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Info lines",
+		Description = "Extra text you set with object:SetLines",
+		Default = settings.Lines,
+		Flag = "ESP.Lines",
+		Callback = function(value)
+			ESP:Configure({ Lines = value })
+		end,
+	})
+	self:AddToggle({
+		Name = "Glow outline",
+		Description = "Highlights the whole model",
+		Default = settings.Highlight,
+		Flag = "ESP.Highlight",
+		Callback = function(value)
+			ESP:Configure({ Highlight = value })
+		end,
+	})
+	self:AddSlider({
+		Name = "Max distance",
+		Min = 100,
+		Max = 3000,
+		Increment = 50,
+		Default = settings.MaxDistance,
+		Flag = "ESP.MaxDistance",
+		Callback = function(value)
+			ESP:Configure({ MaxDistance = value })
+		end,
+	})
+	self:AddColorPicker({
+		Name = "ESP color",
+		Default = settings.Color,
+		Flag = "ESP.Color",
+		Callback = function(color)
+			ESP:Configure({ Color = color })
+		end,
+	})
+end
+
+return Elements
+end
+
+modules["Extras/ESP/ESP"] = function(...)
+-- ESP: world overlays (box, name, health bar, distance, extra lines) for anything you point it at.
+-- Moon does not look for players or read their health for you: you add targets and set the values.
+local import = ...
+
+local Moon = import("Core/Moon")
+local Services = import("Core/Services")
+local RunService = Services.RunService
+local Fonts = import("Core/Fonts")
+local FONT, FONT_BOLD = Fonts.FONT, Fonts.FONT_BOLD
+local Colors = import("Theme/Colors")
+local WHITE, RGB, HealthColor = Colors.WHITE, Colors.RGB, Colors.HealthColor
+local Util = import("Core/Util")
+local Create, Tween, Corner, GetGuiParent = Util.Create, Util.Tween, Util.Corner, Util.GetGuiParent
+
+local RED = RGB(226, 100, 88)
+local LINE_COLOR = RGB(214, 218, 230)
+
+local ESP = {
+	Enabled = true,
+	-- defaults for every object; override one object with ESP:Add(target, { Box = false, ... })
+	Settings = {
+		Box = true,
+		BoxStyle = "Corners", -- "Corners" | "Full"
+		Name = true,
+		Health = true,
+		HealthText = false,
+		Distance = true,
+		Lines = true,
+		Highlight = false,
+		AlwaysOnTop = true,
+		MaxDistance = 1000,
+		Unit = "m",
+		Color = RGB(184, 196, 240),
+	},
+	_objects = {},
+	_count = 0,
+}
+Moon.ESP = ESP
+
+local Object = {}
+Object.__index = Object
+
+local function folder()
+	if not ESP._folder or not ESP._folder.Parent then
+		ESP._folder = Create("Folder", { Name = "MoonESP", Parent = GetGuiParent() })
+	end
+	return ESP._folder
+end
+
+local function rootOf(target)
+	if target:IsA("BasePart") then
+		return target
+	elseif target:IsA("Model") then
+		return target.PrimaryPart or target:FindFirstChild("HumanoidRootPart") or target:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return nil
+end
+
+local function sizeOf(target)
+	if target:IsA("Model") then
+		local ok, size = pcall(function()
+			return target:GetExtentsSize()
+		end)
+		if ok then
+			return size
+		end
+	elseif target:IsA("BasePart") then
+		return target.Size
+	end
+	return Vector3.new(4, 6, 2)
+end
+
+-- per-object option, falling back to the global setting
+local function opt(object, key)
+	local value = object.Opts[key]
+	if value == nil then
+		value = ESP.Settings[key]
+	end
+	return value
+end
+
+local function startLoop()
+	if ESP._loop then
+		return
+	end
+	ESP._loop = RunService.RenderStepped:Connect(function()
+		local camera = workspace.CurrentCamera
+		if not camera then
+			return
+		end
+		local now = os.clock()
+		for _, object in pairs(ESP._objects) do
+			object:Update(camera, now)
+		end
+	end)
+end
+
+local function stopLoop()
+	if ESP._loop and ESP._count == 0 then
+		ESP._loop:Disconnect()
+		ESP._loop = nil
+	end
+end
+
+----------------------------------------------------------------------
+-- One ESP object
+----------------------------------------------------------------------
+
+function Object:_build(size)
+	local root = self.Root
+
+	-- box: a pixel-sized billboard whose size is recalculated from the camera every frame
+	self.BoxGui = Create("BillboardGui", {
+		Name = "Box",
+		Adornee = root,
+		AlwaysOnTop = true,
+		Size = UDim2.fromOffset(40, 60),
+		LightInfluence = 0,
+		ResetOnSpawn = false,
+		Active = false,
+		Enabled = false,
+		Parent = folder(),
+	})
+	local boxHolder = Create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = self.BoxGui })
+	self._corners = Create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = boxHolder })
+	self._boxParts = {}
+	for _, corner in ipairs({ { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } }) do
+		local ax, ay = corner[1], corner[2]
+		for _, vertical in ipairs({ false, true }) do
+			table.insert(self._boxParts, Create("Frame", {
+				AnchorPoint = Vector2.new(ax, ay),
+				Position = UDim2.fromScale(ax, ay),
+				Size = vertical and UDim2.new(0, 2, 0.22, 0) or UDim2.new(0.3, 0, 0, 2),
+				BorderSizePixel = 0,
+				Parent = self._corners,
+			}))
+		end
+	end
+	self._full = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 0.93,
+		BorderSizePixel = 0,
+		Visible = false,
+		Parent = boxHolder,
+	})
+	self._fullStroke = Create("UIStroke", { Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = self._full })
+
+	-- tag: name, health bar, distance, extra lines (constant pixel size, sits above the head)
+	self.TagGui = Create("BillboardGui", {
+		Name = "Tag",
+		Adornee = root,
+		AlwaysOnTop = true,
+		Size = UDim2.fromOffset(180, 60),
+		StudsOffsetWorldSpace = Vector3.new(0, size.Y / 2 + 0.8, 0),
+		SizeOffset = Vector2.new(0, 0.5),
+		LightInfluence = 0,
+		ResetOnSpawn = false,
+		Active = false,
+		Enabled = false,
+		Parent = folder(),
+	})
+	self._group = Create("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		GroupTransparency = 1,
+		Parent = self.TagGui,
+	})
+	self._pop = Create("UIScale", { Parent = self._group })
+
+	self._name = Create("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = FONT_BOLD,
+		TextSize = 13,
+		TextStrokeTransparency = 0.4,
+		TextStrokeColor3 = Color3.new(0, 0, 0),
+		Parent = self._group,
+	})
+
+	self._health = Create("Frame", { BackgroundTransparency = 1, Parent = self._group })
+	self._track = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(84, 5),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.45,
+		BorderSizePixel = 0,
+		Parent = self._health,
+	})
+	Corner(self._track, "pill")
+	self._trail = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 0.35,
+		BorderSizePixel = 0,
+		Parent = self._track,
+	})
+	Corner(self._trail, "pill")
+	self._fill = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = HealthColor(1),
+		BorderSizePixel = 0,
+		Parent = self._track,
+	})
+	Corner(self._fill, "pill")
+	self._healthText = Create("TextLabel", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0.5, 32, 0.5, 0),
+		Size = UDim2.fromOffset(40, 12),
+		BackgroundTransparency = 1,
+		Font = FONT_BOLD,
+		TextSize = 11,
+		TextColor3 = WHITE,
+		TextStrokeTransparency = 0.5,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Visible = false,
+		Parent = self._health,
+	})
+
+	self._distance = Create("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 12,
+		TextColor3 = LINE_COLOR,
+		TextStrokeTransparency = 0.5,
+		Parent = self._group,
+	})
+	self._lines = Create("Frame", { BackgroundTransparency = 1, Parent = self._group })
+end
+
+-- stacks the visible rows and sizes the tag billboard to fit
+function Object:Layout()
+	local y = 0
+	local function place(row, show, height)
+		row.Visible = show
+		if show then
+			row.Position = UDim2.fromOffset(0, y)
+			row.Size = UDim2.new(1, 0, 0, height)
+			y = y + height + 2
+		end
+	end
+	place(self._name, opt(self, "Name") and self.Name ~= "", 16)
+	place(self._health, opt(self, "Health") and self.Health ~= nil, 10)
+	place(self._distance, opt(self, "Distance"), 14)
+	local lineCount = opt(self, "Lines") and #self.Lines or 0
+	place(self._lines, lineCount > 0, lineCount * 13)
+
+	local withText = opt(self, "HealthText")
+	self._healthText.Visible = withText
+	self._track.Position = withText and UDim2.new(0.5, -14, 0.5, 0) or UDim2.fromScale(0.5, 0.5)
+	self.TagGui.Size = UDim2.fromOffset(180, math.max(y, 4))
+end
+
+function Object:_applyColor()
+	local color = self.Color or ESP.Settings.Color
+	self._name.TextColor3 = color
+	for _, part in ipairs(self._boxParts) do
+		part.BackgroundColor3 = color
+	end
+	self._full.BackgroundColor3 = color
+	self._fullStroke.Color = color
+	if self._highlight then
+		self._highlight.FillColor = color
+		self._highlight.OutlineColor = color
+	end
+end
+
+-- re-applies every option (call after changing settings)
+function Object:Refresh()
+	self.BoxGui.AlwaysOnTop = opt(self, "AlwaysOnTop")
+	self.TagGui.AlwaysOnTop = opt(self, "AlwaysOnTop")
+	self.BoxGui.Enabled = self._shown and opt(self, "Box")
+	local style = opt(self, "BoxStyle")
+	self._corners.Visible = style ~= "Full"
+	self._full.Visible = style == "Full"
+
+	if opt(self, "Highlight") then
+		if not self._highlight then
+			self._highlight = Create("Highlight", {
+				Adornee = self.Target,
+				FillTransparency = 0.8,
+				OutlineTransparency = 0,
+				DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+				Parent = folder(),
+			})
+		end
+		self._highlight.Enabled = self._shown
+	elseif self._highlight then
+		self._highlight.Enabled = false
+	end
+
+	self:_applyColor()
+	self:Layout()
+end
+
+function Object:_setShown(shown)
+	self._shown = shown
+	self.TagGui.Enabled = shown
+	self.BoxGui.Enabled = shown and opt(self, "Box")
+	if self._highlight then
+		self._highlight.Enabled = shown and opt(self, "Highlight")
+	end
+	if shown then
+		self._group.GroupTransparency = 1
+		self._pop.Scale = 0.85
+		Tween(self._group, { GroupTransparency = 0 }, 0.25)
+		Tween(self._pop, { Scale = 1 }, 0.3, Enum.EasingStyle.Back)
+	end
+end
+
+function Object:Update(camera, now)
+	local root = self.Root
+	if not root.Parent then
+		-- the part was replaced (for example the character respawned its root)
+		local replacement = rootOf(self.Target)
+		if not replacement then
+			if self._shown then
+				self:_setShown(false)
+			end
+			return
+		end
+		self.Root = replacement
+		root = replacement
+		self.BoxGui.Adornee = replacement
+		self.TagGui.Adornee = replacement
+	end
+
+	local position = root.Position
+	local distance = (camera.CFrame.Position - position).Magnitude
+	local shown = ESP.Enabled and self.Visible and distance <= opt(self, "MaxDistance")
+	if shown ~= self._shown then
+		self:_setShown(shown)
+	end
+	if not shown then
+		return
+	end
+
+	if opt(self, "Box") then
+		local top = camera:WorldToViewportPoint(position + Vector3.new(0, self._halfHeight, 0))
+		local bottom = camera:WorldToViewportPoint(position - Vector3.new(0, self._halfHeight, 0))
+		local height = math.max(math.abs(top.Y - bottom.Y), 10)
+		self.BoxGui.Size = UDim2.fromOffset(height * self._aspect, height)
+	end
+	if opt(self, "Distance") then
+		local value = math.floor((self.DistanceOverride or distance) + 0.5)
+		if value ~= self._lastDistance then
+			self._lastDistance = value
+			self._distance.Text = value .. opt(self, "Unit")
+		end
+	end
+	if self._low then
+		self._fill.BackgroundColor3 = RED:Lerp(WHITE, (math.sin(now * 7) + 1) * 0.2)
+	end
+end
+
+-- values you set ---------------------------------------------------------
+
+function Object:SetName(text)
+	self.Name = tostring(text or "")
+	self._name.Text = self.Name
+	self:Layout()
+	return self
+end
+
+function Object:SetHealth(value, max)
+	max = max or self.MaxHealth or 100
+	local previous = self.Health
+	self.Health, self.MaxHealth = value, max
+	local fraction = math.clamp(value / math.max(max, 1), 0, 1)
+
+	Tween(self._fill, { Size = UDim2.fromScale(fraction, 1), BackgroundColor3 = HealthColor(fraction) }, 0.2)
+	if previous ~= nil and value < previous then
+		-- damage: the white trail lingers, then catches up; the name flashes red
+		task.delay(0.35, function()
+			if self._trail.Parent then
+				Tween(self._trail, { Size = UDim2.fromScale(fraction, 1) }, 0.45)
+			end
+		end)
+		self._name.TextColor3 = RED
+		Tween(self._name, { TextColor3 = self.Color or ESP.Settings.Color }, 0.4)
+	else
+		Tween(self._trail, { Size = UDim2.fromScale(fraction, 1) }, 0.2)
+	end
+	self._healthText.Text = tostring(math.floor(value + 0.5))
+	self._low = fraction > 0 and fraction <= 0.25
+	self:Layout()
+	return self
+end
+
+function Object:SetDistance(value)
+	self.DistanceOverride = value
+	return self
+end
+
+function Object:SetLines(lines)
+	self.Lines = lines or {}
+	for _, label in ipairs(self._lineLabels) do
+		label:Destroy()
+	end
+	table.clear(self._lineLabels)
+	for index, text in ipairs(self.Lines) do
+		table.insert(self._lineLabels, Create("TextLabel", {
+			Position = UDim2.fromOffset(0, (index - 1) * 13),
+			Size = UDim2.new(1, 0, 0, 13),
+			BackgroundTransparency = 1,
+			Text = tostring(text),
+			Font = FONT,
+			TextSize = 11,
+			TextColor3 = LINE_COLOR,
+			TextStrokeTransparency = 0.5,
+			Parent = self._lines,
+		}))
+	end
+	self:Layout()
+	return self
+end
+
+function Object:SetColor(color)
+	self.Color = color
+	self:_applyColor()
+	return self
+end
+
+function Object:SetVisible(visible)
+	self.Visible = visible and true or false
+	return self
+end
+
+-- optional convenience: keeps the health bar in sync with a Humanoid
+function Object:BindHumanoid(humanoid)
+	if self._humanoidConn then
+		self._humanoidConn:Disconnect()
+		self._humanoidConn = nil
+	end
+	if humanoid then
+		self:SetHealth(humanoid.Health, humanoid.MaxHealth)
+		self._humanoidConn = humanoid.HealthChanged:Connect(function(health)
+			self:SetHealth(health, humanoid.MaxHealth)
+		end)
+	end
+	return self
+end
+
+-- set several things at once: object:Set({ Name = "Bot", Health = 80, MaxHealth = 100, Lines = { "Red team" }, Box = false })
+function Object:Set(values)
+	local VALUE_KEYS = { Name = true, Health = true, MaxHealth = true, Distance = true, Lines = true, Color = true, Visible = true }
+	for key, value in pairs(values) do
+		if not VALUE_KEYS[key] then
+			self.Opts[key] = value
+		end
+	end
+	if values.Name ~= nil then
+		self:SetName(values.Name)
+	end
+	if values.MaxHealth ~= nil then
+		self.MaxHealth = values.MaxHealth
+	end
+	if values.Health ~= nil then
+		self:SetHealth(values.Health, values.MaxHealth)
+	end
+	if values.Distance ~= nil then
+		self:SetDistance(values.Distance)
+	end
+	if values.Lines ~= nil then
+		self:SetLines(values.Lines)
+	end
+	if values.Color ~= nil then
+		self.Color = values.Color
+	end
+	if values.Visible ~= nil then
+		self.Visible = values.Visible and true or false
+	end
+	self:Refresh()
+	return self
+end
+
+function Object:Destroy()
+	if ESP._objects[self.Target] ~= self then
+		return
+	end
+	ESP._objects[self.Target] = nil
+	ESP._count = ESP._count - 1
+	for _, connection in ipairs(self._conns) do
+		connection:Disconnect()
+	end
+	if self._humanoidConn then
+		self._humanoidConn:Disconnect()
+	end
+	self.BoxGui:Destroy()
+	self.TagGui:Destroy()
+	if self._highlight then
+		self._highlight:Destroy()
+	end
+	stopLoop()
+end
+
+----------------------------------------------------------------------
+-- Manager
+----------------------------------------------------------------------
+
+-- Adds (or updates) an ESP object for a Model or a part. Returns the object.
+function ESP:Add(target, opts)
+	if typeof(target) ~= "Instance" then
+		error("[Moon.ESP] Add expects an Instance (a Model or a part)", 2)
+	end
+	local existing = ESP._objects[target]
+	if existing then
+		existing:Set(opts or {})
+		return existing
+	end
+	local root = rootOf(target)
+	if not root then
+		warn("[Moon.ESP] no part found inside " .. target:GetFullName())
+		return nil
+	end
+
+	local size = sizeOf(target)
+	local object = setmetatable({
+		Target = target,
+		Root = root,
+		Opts = {},
+		Name = target.Name,
+		MaxHealth = 100,
+		Lines = {},
+		Visible = true,
+		_shown = false,
+		_halfHeight = size.Y / 2,
+		_aspect = math.clamp(math.max(size.X, size.Z) / math.max(size.Y, 0.1), 0.35, 1.2),
+		_lineLabels = {},
+		_low = false,
+		_conns = {},
+	}, Object)
+	object:_build(size)
+	object._name.Text = object.Name
+	table.insert(object._conns, target.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			object:Destroy()
+		end
+	end))
+
+	ESP._objects[target] = object
+	ESP._count = ESP._count + 1
+	object:Set(opts or {})
+	startLoop()
+	return object
+end
+
+function ESP:Get(target)
+	return ESP._objects[target]
+end
+
+function ESP:Remove(target)
+	local object = ESP._objects[target]
+	if object then
+		object:Destroy()
+	end
+end
+
+function ESP:Clear()
+	for _, object in pairs(table.clone(ESP._objects)) do
+		object:Destroy()
+	end
+end
+
+function ESP:Count()
+	return ESP._count
+end
+
+-- master switch for every object
+function ESP:SetEnabled(enabled)
+	ESP.Enabled = enabled and true or false
+	return ESP
+end
+
+-- change the defaults for every object: ESP:Configure({ Box = false, MaxDistance = 500, Color = Color3.new(1, 0, 0) })
+function ESP:Configure(settings)
+	for key, value in pairs(settings) do
+		ESP.Settings[key] = value
+	end
+	for _, object in pairs(ESP._objects) do
+		object:Refresh()
+	end
+	return ESP
+end
+
+return ESP
+end
+
+modules["Extras/ESP/Index"] = function(...)
+-- Moon:Use("ESP") loads this: the ESP engine plus its ready-made controls.
+local import = ...
+
+local ESP = import("Extras/ESP/ESP")
+import("Extras/ESP/Controls")
+
+return ESP
+end
+
+modules["Extras/TargetCard"] = function(...)
+-- Target card: a glass card with a player's face, name, health bar and info chips, with small animations.
+-- Moon does not find targets or read health for you: you call SetTarget / SetHealth with your own data.
+--
+--   local card = Window:CreateTargetCard({ Position = "TopCenter" })
+--   card:SetTarget({ Name = "Enemy", Sub = "@enemy123", UserId = 1, Health = 100, MaxHealth = 100, Info = { "Team: Red", "AK-47" } }):Show()
+--   card:SetHealth(60)      -- animates, shakes and flashes on damage
+--   card:Hide()
+local import = ...
+
+local Services = import("Core/Services")
+local Players, RunService = Services.Players, Services.RunService
+local Fonts = import("Core/Fonts")
+local FONT, FONT_MED, FONT_BOLD = Fonts.FONT, Fonts.FONT_MED, Fonts.FONT_BOLD
+local Colors = import("Theme/Colors")
+local WHITE, RGB, HealthColor = Colors.WHITE, Colors.RGB, Colors.HealthColor
+local Util = import("Core/Util")
+local Create, Tween, Corner = Util.Create, Util.Tween, Util.Corner
+local Binding = import("Theme/Binding")
+local Bind, Themed, NewText, Stroke = Binding.Bind, Binding.Themed, Binding.NewText, Binding.Stroke
+local Window = import("Window/Window")
+
+local GRAY = RGB(110, 110, 118)
+local avatarCache = {}
+
+-- anchor, position, direction the card slides in from
+local POSITIONS = {
+	TopCenter = { Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 12), -18 },
+	TopLeft = { Vector2.new(0, 0), UDim2.new(0, 12, 0, 12), -18 },
+	TopRight = { Vector2.new(1, 0), UDim2.new(1, -12, 0, 58), -18 }, -- below the watermark
+	BottomCenter = { Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, -84), 18 },
+}
+
+function Window:CreateTargetCard(opts)
+	opts = opts or {}
+	local window = self
+	local theme = self.Theme
+	local positionName = POSITIONS[opts.Position] and opts.Position or "TopCenter"
+	local baseWidth = opts.Width or 290
+
+	local card = { Visible = false }
+	local state = "ok" -- "ok" | "low" | "dead"
+	local health, maxHealth = nil, 100
+	local subText = ""
+	local chipCount = 0
+	local avatarToken = 0
+	local humanoidConn
+
+	local root = Create("CanvasGroup", {
+		Name = "MoonTargetCard",
+		Size = UDim2.fromOffset(baseWidth, 86),
+		BackgroundTransparency = 0.06,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Visible = false,
+		Parent = self.Overlay,
+	})
+	Bind(window, root, "BackgroundColor3", "Background")
+	Corner(root, 12)
+	local border = Stroke(window, root, "Border", "BorderTransparency")
+	local scale = Create("UIScale", { Parent = root })
+
+	-- soft accent glow on the left edge
+	local glow = Create("Frame", { Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, Parent = root })
+	Bind(window, glow, "BackgroundColor3", "Accent")
+	Create("UIGradient", {
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.82),
+			NumberSequenceKeypoint.new(0.6, 1),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+		Parent = glow,
+	})
+
+	-- avatar with a ring that follows the health state
+	local avatarHolder = Create("Frame", {
+		Size = UDim2.fromOffset(56, 56),
+		Position = UDim2.fromOffset(14, 15),
+		BackgroundTransparency = 1,
+		Parent = root,
+	})
+	local avatarScale = Create("UIScale", { Parent = avatarHolder })
+	local avatar = Create("ImageLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BorderSizePixel = 0,
+		ScaleType = Enum.ScaleType.Crop,
+		Image = "",
+		Parent = avatarHolder,
+	})
+	Themed(window, avatar, { BackgroundColor3 = "Control", BackgroundTransparency = "ControlTransparency" })
+	Corner(avatar, "pill")
+	local ring = Stroke(window, avatar, function(t)
+		return state == "ok" and t.Accent or t.Bad
+	end, 0.15, 2)
+
+	local nameLabel = NewText(window, root, "Target", {
+		Position = UDim2.fromOffset(84, 12),
+		Size = UDim2.new(1, -170, 0, 18),
+		Font = FONT_BOLD,
+		TextSize = 15,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	local subLabel = NewText(window, root, "", {
+		Position = UDim2.fromOffset(84, 31),
+		Size = UDim2.new(1, -98, 0, 16),
+		Font = FONT,
+		TextSize = 12,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, "SubText")
+	local healthText = NewText(window, root, "", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -14, 0, 12),
+		Size = UDim2.fromOffset(80, 18),
+		Font = FONT_BOLD,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+
+	-- health bar: the fill moves fast, the white trail lingers behind it
+	local track = Create("Frame", {
+		Position = UDim2.fromOffset(84, 54),
+		Size = UDim2.new(1, -98, 0, 8),
+		BackgroundTransparency = 0.85,
+		BorderSizePixel = 0,
+		Parent = root,
+	})
+	Bind(window, track, "BackgroundColor3", "Text")
+	Corner(track, "pill")
+	local trail = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 0.3,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	Corner(trail, "pill")
+	local fill = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = HealthColor(1),
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	Corner(fill, "pill")
+
+	-- info chips
+	local chips = Create("Frame", {
+		Position = UDim2.fromOffset(84, 70),
+		Size = UDim2.new(1, -98, 0, 20),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Parent = root,
+	})
+	Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = chips,
+	})
+
+	-- the number counts up/down smoothly
+	local counter = Instance.new("NumberValue")
+	counter.Changed:Connect(function(value)
+		healthText.Text = string.format("%d / %d", math.floor(value + 0.5), maxHealth)
+	end)
+
+	-- layout helpers ----------------------------------------------------
+
+	local function basePosition()
+		local pos = POSITIONS[positionName][2]
+		if positionName:sub(1, 3) == "Top" then
+			pos = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, pos.Y.Offset + (window._topInset or 0))
+		end
+		return pos
+	end
+
+	local function offsetPosition(pos)
+		return UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, pos.Y.Offset + POSITIONS[positionName][3])
+	end
+
+	local function resize()
+		local width = math.min(baseWidth, math.max(window.Overlay.AbsoluteSize.X - 24, 200))
+		Tween(root, { Size = UDim2.fromOffset(width, chipCount > 0 and 98 or 80) }, 0.2)
+	end
+
+	local function refreshSub()
+		subLabel.Text = state == "dead" and "Eliminated" or subText
+	end
+
+	local function flashBorder(color)
+		border.Color = color
+		border.Transparency = 0
+		Tween(border, { Color = theme.Border, Transparency = theme.BorderTransparency }, 0.5)
+	end
+
+	local function shake()
+		if not card.Visible then
+			return
+		end
+		task.spawn(function()
+			local base = basePosition()
+			for i = 1, 5 do
+				local offset = (i % 2 == 0 and 1 or -1) * (7 - i)
+				root.Position = UDim2.new(base.X.Scale, base.X.Offset + offset, base.Y.Scale, base.Y.Offset)
+				task.wait(0.035)
+			end
+			root.Position = base
+		end)
+	end
+
+	local function setState(newState)
+		if newState == state then
+			return
+		end
+		state = newState
+		Tween(avatar, { ImageColor3 = state == "dead" and GRAY or WHITE }, 0.25)
+		Tween(ring, { Color = state == "ok" and theme.Accent or theme.Bad }, 0.25)
+		if state ~= "low" then
+			ring.Transparency = 0.15
+		end
+		refreshSub()
+	end
+
+	-- low health: the ring pulses
+	window:_connect(RunService.RenderStepped, function()
+		if card.Visible and state == "low" then
+			ring.Transparency = 0.1 + (math.sin(os.clock() * 6) + 1) * 0.15
+		end
+	end)
+
+	-- public api --------------------------------------------------------
+
+	function card:Show()
+		if card.Visible then
+			return card
+		end
+		card.Visible = true
+		root.AnchorPoint = POSITIONS[positionName][1]
+		resize()
+		local final = basePosition()
+		root.Position = offsetPosition(final)
+		root.GroupTransparency = 1
+		root.Visible = true
+		scale.Scale = 0.96
+		avatarScale.Scale = 0.6
+		Tween(root, { Position = final }, 0.35, Enum.EasingStyle.Back)
+		Tween(root, { GroupTransparency = 0 }, 0.2)
+		Tween(scale, { Scale = 1 }, 0.3, Enum.EasingStyle.Back)
+		Tween(avatarScale, { Scale = 1 }, 0.45, Enum.EasingStyle.Back)
+		return card
+	end
+
+	function card:Hide()
+		if not card.Visible then
+			return card
+		end
+		card.Visible = false
+		Tween(root, { GroupTransparency = 1 }, 0.18)
+		Tween(root, { Position = offsetPosition(basePosition()) }, 0.2)
+		task.delay(0.22, function()
+			if not card.Visible then
+				root.Visible = false
+			end
+		end)
+		return card
+	end
+
+	function card:Toggle()
+		if card.Visible then
+			return card:Hide()
+		end
+		return card:Show()
+	end
+
+	function card:IsVisible()
+		return card.Visible
+	end
+
+	function card:SetName(text)
+		nameLabel.Text = tostring(text or "")
+		return card
+	end
+
+	function card:SetSub(text)
+		subText = tostring(text or "")
+		refreshSub()
+		return card
+	end
+
+	-- a UserId (number) loads that player's face; a string is used as an image directly
+	function card:SetAvatar(source)
+		avatarToken = avatarToken + 1
+		local token = avatarToken
+		if type(source) == "number" then
+			local cached = avatarCache[source]
+			if cached then
+				avatar.Image = cached
+			else
+				avatar.Image = ""
+				task.spawn(function()
+					local ok, content = pcall(function()
+						return Players:GetUserThumbnailAsync(source, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+					end)
+					if ok and content then
+						avatarCache[source] = content
+						if token == avatarToken and avatar.Parent then
+							avatar.Image = content
+						end
+					end
+				end)
+			end
+		elseif type(source) == "string" then
+			avatar.Image = source
+		else
+			avatar.Image = ""
+		end
+		if card.Visible then
+			avatarScale.Scale = 0.75
+			Tween(avatarScale, { Scale = 1 }, 0.35, Enum.EasingStyle.Back)
+		end
+		return card
+	end
+
+	-- small chips under the bar: card:SetInfo({ "Team: Red", "AK-47", "42m" })
+	function card:SetInfo(lines)
+		for _, child in ipairs(chips:GetChildren()) do
+			if child:IsA("TextLabel") then
+				child:Destroy()
+			end
+		end
+		chipCount = 0
+		for index, text in ipairs(lines or {}) do
+			local chip = Create("TextLabel", {
+				Size = UDim2.new(0, 0, 1, 0),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundTransparency = 0.9,
+				BorderSizePixel = 0,
+				Text = tostring(text),
+				Font = FONT_MED,
+				TextSize = 11,
+				LayoutOrder = index,
+				Parent = chips,
+			})
+			Themed(window, chip, { BackgroundColor3 = "Text", TextColor3 = "SubText" })
+			Corner(chip, "pill")
+			Create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = chip })
+			chipCount = chipCount + 1
+		end
+		resize()
+		return card
+	end
+
+	function card:SetHealth(value, max)
+		max = max or maxHealth
+		local previous = health
+		health, maxHealth = value, max
+		local fraction = math.clamp(value / math.max(max, 1), 0, 1)
+
+		Tween(fill, { Size = UDim2.fromScale(fraction, 1), BackgroundColor3 = HealthColor(fraction) }, 0.22)
+		Tween(counter, { Value = value }, 0.3)
+		if previous ~= nil and value < previous then
+			task.delay(0.35, function()
+				if trail.Parent then
+					Tween(trail, { Size = UDim2.fromScale(fraction, 1) }, 0.45)
+				end
+			end)
+			flashBorder(theme.Bad)
+			shake()
+		else
+			Tween(trail, { Size = UDim2.fromScale(fraction, 1) }, 0.22)
+			if previous ~= nil and value > previous then
+				flashBorder(theme.Good)
+			end
+		end
+		setState(value <= 0 and "dead" or (fraction <= 0.25 and "low" or "ok"))
+		return card
+	end
+
+	-- everything at once: Name, Sub, UserId or Image, Health, MaxHealth, Info
+	function card:SetTarget(info)
+		info = info or {}
+		health = nil -- a new target never plays the damage animation
+		card:SetName(info.Name or "Target")
+		card:SetSub(info.Sub)
+		card:SetAvatar(info.UserId or info.Image)
+		card:SetInfo(info.Info)
+		if info.Health ~= nil then
+			card:SetHealth(info.Health, info.MaxHealth)
+		end
+		if card.Visible then
+			Tween(scale, { Scale = 0.97 }, 0.07)
+			task.delay(0.07, function()
+				Tween(scale, { Scale = 1 }, 0.2, Enum.EasingStyle.Back)
+			end)
+		end
+		return card
+	end
+
+	-- convenience: fills name, @username and face from a Player (health is still yours to set)
+	function card:SetPlayer(player)
+		return card:SetTarget({ Name = player.DisplayName, Sub = "@" .. player.Name, UserId = player.UserId })
+	end
+
+	function card:SetPosition(name)
+		if not POSITIONS[name] then
+			return card
+		end
+		positionName = name
+		if card.Visible then
+			root.AnchorPoint = POSITIONS[name][1]
+			Tween(root, { Position = basePosition() }, 0.3)
+		end
+		return card
+	end
+
+	-- optional convenience: keeps the card's health in sync with a Humanoid
+	function card:BindHumanoid(humanoid)
+		if humanoidConn then
+			humanoidConn:Disconnect()
+			humanoidConn = nil
+		end
+		if humanoid then
+			card:SetHealth(humanoid.Health, humanoid.MaxHealth)
+			humanoidConn = humanoid.HealthChanged:Connect(function(value)
+				card:SetHealth(value, humanoid.MaxHealth)
+			end)
+		end
+		return card
+	end
+
+	function card:Destroy()
+		if humanoidConn then
+			humanoidConn:Disconnect()
+		end
+		counter:Destroy()
+		root:Destroy()
+	end
+
+	card:SetHealth(100, 100)
+	if opts.Visible then
+		card:Show()
+	end
+	return card
+end
+
+return Window
+end
+
+modules["Extras/Visuals/Controls"] = function(...)
+-- Ready-made controls for the visuals: drop them into any tab or section.
+local import = ...
+
+local Elements = import("UI/Elements/Base")
+local Visuals = import("Extras/Visuals/Visuals")
+
+function Elements:AddVisualsControls()
+	local options = Visuals:List()
+	table.insert(options, 1, "Off")
+
+	self:AddDropdown({
+		Name = "Preset",
+		Description = "Looks that blend in smoothly",
+		Options = options,
+		Default = "Off",
+		Flag = "Visuals.Preset",
+		Callback = function(name)
+			if name == "Off" then
+				Visuals:Reset()
+			else
+				Visuals:Apply(name)
+			end
+		end,
+	})
+	self:AddSlider({
+		Name = "Bloom",
+		Min = 0,
+		Max = 3,
+		Increment = 0.05,
+		Default = 0,
+		Flag = "Visuals.Bloom",
+		Callback = function(value)
+			Visuals:Set("Bloom", { Intensity = value, Size = 28, Threshold = 1.1 }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Contrast",
+		Min = -0.5,
+		Max = 0.5,
+		Increment = 0.01,
+		Default = 0,
+		Flag = "Visuals.Contrast",
+		Callback = function(value)
+			Visuals:Set("ColorCorrection", { Contrast = value }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Saturation",
+		Min = -1,
+		Max = 1,
+		Increment = 0.05,
+		Default = 0,
+		Flag = "Visuals.Saturation",
+		Callback = function(value)
+			Visuals:Set("ColorCorrection", { Saturation = value }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Brightness",
+		Min = -0.3,
+		Max = 0.3,
+		Increment = 0.01,
+		Default = 0,
+		Flag = "Visuals.Brightness",
+		Callback = function(value)
+			Visuals:Set("ColorCorrection", { Brightness = value }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Sun rays",
+		Min = 0,
+		Max = 1,
+		Increment = 0.02,
+		Default = 0,
+		Flag = "Visuals.SunRays",
+		Callback = function(value)
+			Visuals:Set("SunRays", { Intensity = value, Spread = 0.8 }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Depth of field",
+		Min = 0,
+		Max = 1,
+		Increment = 0.02,
+		Default = 0,
+		Flag = "Visuals.DepthOfField",
+		Callback = function(value)
+			Visuals:Set("DepthOfField", { FarIntensity = value, FocusDistance = 40, InFocusRadius = 35 }, 0.15)
+		end,
+	})
+	self:AddSlider({
+		Name = "Time of day",
+		Min = 0,
+		Max = 24,
+		Increment = 0.1,
+		Default = game:GetService("Lighting").ClockTime,
+		Flag = "Visuals.Time",
+		Callback = function(value)
+			Visuals:Set("Lighting", { ClockTime = value }, 0.15)
+		end,
+	})
+	local camera = workspace.CurrentCamera
+	self:AddSlider({
+		Name = "Field of view",
+		Min = 40,
+		Max = 120,
+		Default = camera and math.floor(camera.FieldOfView + 0.5) or 70,
+		Flag = "Visuals.FOV",
+		Callback = function(value)
+			Visuals:Set("Camera", { FieldOfView = value }, 0.15)
+		end,
+	})
+	self:AddColorPicker({
+		Name = "Color tint",
+		Default = Color3.new(1, 1, 1),
+		Flag = "Visuals.Tint",
+		Callback = function(color)
+			Visuals:Set("ColorCorrection", { TintColor = color }, 0.2)
+		end,
+	})
+	self:AddButton({
+		Name = "Reset visuals",
+		Description = "Puts the game's lighting back as it was",
+		ButtonText = "Reset",
+		Callback = function()
+			Visuals:Reset()
+		end,
+	})
+end
+
+return Elements
+end
+
+modules["Extras/Visuals/Index"] = function(...)
+-- Moon:Use("Visuals") loads this: the lighting presets plus their ready-made controls.
+local import = ...
+
+local Visuals = import("Extras/Visuals/Visuals")
+import("Extras/Visuals/Controls")
+
+return Visuals
+end
+
+modules["Extras/Visuals/Visuals"] = function(...)
+-- Visuals: lighting and post-processing presets that make any game look better.
+-- Everything blends smoothly, and Visuals:Reset() puts the game back exactly as it was.
+--
+--   Moon.Visuals:Apply("Cinematic")
+--   Moon.Visuals:Set("Bloom", { Intensity = 1.2 })
+--   Moon.Visuals:Reset()
+local import = ...
+
+local Moon = import("Core/Moon")
+local Services = import("Core/Services")
+local Lighting, TweenService = Services.Lighting, Services.TweenService
+local Colors = import("Theme/Colors")
+local WHITE, RGB = Colors.WHITE, Colors.RGB
+
+local Visuals = {
+	Presets = {},
+	Current = nil,
+	_order = {},
+	_ours = {},
+}
+Moon.Visuals = Visuals
+
+local CLASSES = {
+	Bloom = "BloomEffect",
+	ColorCorrection = "ColorCorrectionEffect",
+	SunRays = "SunRaysEffect",
+	DepthOfField = "DepthOfFieldEffect",
+	Atmosphere = "Atmosphere",
+}
+
+-- values that make a freshly created effect do nothing
+local NEUTRAL = {
+	Bloom = { Intensity = 0, Size = 24, Threshold = 2 },
+	ColorCorrection = { Brightness = 0, Contrast = 0, Saturation = 0, TintColor = WHITE },
+	SunRays = { Intensity = 0, Spread = 1 },
+	DepthOfField = { FarIntensity = 0, NearIntensity = 0, FocusDistance = 50, InFocusRadius = 40 },
+	Atmosphere = { Density = 0, Offset = 0, Glare = 0, Haze = 0 },
+}
+
+local LIGHTING_KEYS = {
+	"Brightness", "ClockTime", "Ambient", "OutdoorAmbient", "ExposureCompensation",
+	"FogColor", "FogStart", "FogEnd", "EnvironmentDiffuseScale", "EnvironmentSpecularScale",
+}
+local ATMOSPHERE_KEYS = { "Density", "Offset", "Color", "Decay", "Glare", "Haze" }
+
+-- what the game looked like before we touched anything
+local snap
+local function snapshot()
+	if snap then
+		return snap
+	end
+	snap = { Lighting = {} }
+	for _, key in ipairs(LIGHTING_KEYS) do
+		local ok, value = pcall(function()
+			return Lighting[key]
+		end)
+		if ok then
+			snap.Lighting[key] = value
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		snap.FieldOfView = camera.FieldOfView
+	end
+	return snap
+end
+
+-- numbers and colors blend; anything else (booleans, enums) is set right away
+local function tweenProps(instance, props, duration)
+	local goals = {}
+	for key, value in pairs(props) do
+		local kind = typeof(value)
+		if kind == "number" or kind == "Color3" then
+			goals[key] = value
+		else
+			pcall(function()
+				instance[key] = value
+			end)
+		end
+	end
+	if next(goals) == nil then
+		return
+	end
+	local ok = false
+	if duration and duration > 0 then
+		ok = pcall(function()
+			TweenService:Create(instance, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goals):Play()
+		end)
+	end
+	if not ok then
+		for key, value in pairs(goals) do
+			pcall(function()
+				instance[key] = value
+			end)
+		end
+	end
+end
+
+local function ensure(effect)
+	local existing = Visuals._ours[effect]
+	if existing and existing.Parent then
+		return existing
+	end
+	local class = CLASSES[effect]
+	if not class then
+		return nil
+	end
+	if effect == "Atmosphere" then
+		-- a game can only use one atmosphere: borrow its own and give it back on reset
+		local found = Lighting:FindFirstChildOfClass("Atmosphere")
+		if found then
+			snapshot()
+			if not snap.Atmosphere then
+				snap.Atmosphere = {}
+				for _, key in ipairs(ATMOSPHERE_KEYS) do
+					snap.Atmosphere[key] = found[key]
+				end
+				snap.AtmosphereInstance = found
+			end
+			Visuals._ours[effect] = found
+			return found
+		end
+	end
+	local instance = Instance.new(class)
+	instance.Name = "Moon" .. effect
+	for key, value in pairs(NEUTRAL[effect]) do
+		instance[key] = value
+	end
+	instance.Parent = Lighting
+	Visuals._ours[effect] = instance
+	return instance
+end
+
+local function remove(effect, duration)
+	local instance = Visuals._ours[effect]
+	if not instance then
+		return
+	end
+	Visuals._ours[effect] = nil
+	if snap and snap.AtmosphereInstance == instance then
+		tweenProps(instance, snap.Atmosphere, duration)
+		snap.Atmosphere, snap.AtmosphereInstance = nil, nil
+		return
+	end
+	tweenProps(instance, NEUTRAL[effect], duration)
+	task.delay(duration + 0.05, function()
+		instance:Destroy()
+	end)
+end
+
+-- effect: "Bloom" | "ColorCorrection" | "SunRays" | "DepthOfField" | "Atmosphere" | "Lighting" | "Camera"
+function Visuals:Set(effect, props, duration)
+	snapshot()
+	duration = duration or 0.4
+	if effect == "Lighting" then
+		tweenProps(Lighting, props, duration)
+	elseif effect == "Camera" then
+		local camera = workspace.CurrentCamera
+		if camera then
+			tweenProps(camera, props, duration)
+		end
+	else
+		local instance = ensure(effect)
+		if not instance then
+			warn("[Moon.Visuals] unknown effect: " .. tostring(effect))
+			return Visuals
+		end
+		pcall(function()
+			instance.Enabled = true
+		end)
+		tweenProps(instance, props, duration)
+	end
+	return Visuals
+end
+
+function Visuals:Apply(name, duration)
+	local preset = Visuals.Presets[name]
+	if not preset then
+		warn("[Moon.Visuals] unknown preset: " .. tostring(name))
+		return Visuals
+	end
+	snapshot()
+	duration = duration or 0.6
+
+	for effect in pairs(CLASSES) do
+		if preset[effect] then
+			Visuals:Set(effect, preset[effect], duration)
+		else
+			remove(effect, duration)
+		end
+	end
+
+	-- lighting: preset values on top of the original game values
+	local lighting = {}
+	for key, value in pairs(snap.Lighting) do
+		lighting[key] = value
+	end
+	for key, value in pairs(preset.Lighting or {}) do
+		lighting[key] = value
+	end
+	tweenProps(Lighting, lighting, duration)
+
+	local camera = workspace.CurrentCamera
+	local fov = (preset.Camera and preset.Camera.FieldOfView) or snap.FieldOfView
+	if camera and fov then
+		tweenProps(camera, { FieldOfView = fov }, duration)
+	end
+
+	Visuals.Current = name
+	return Visuals
+end
+
+-- removes every effect Moon added and restores the game's own lighting and field of view
+function Visuals:Reset(duration)
+	duration = duration or 0.6
+	for effect in pairs(CLASSES) do
+		remove(effect, duration)
+	end
+	if snap then
+		tweenProps(Lighting, snap.Lighting, duration)
+		local camera = workspace.CurrentCamera
+		if camera and snap.FieldOfView then
+			tweenProps(camera, { FieldOfView = snap.FieldOfView }, duration)
+		end
+	end
+	Visuals.Current = nil
+	return Visuals
+end
+
+function Visuals:AddPreset(name, definition)
+	if not Visuals.Presets[name] then
+		table.insert(Visuals._order, name)
+	end
+	Visuals.Presets[name] = definition
+	return Visuals
+end
+
+function Visuals:List()
+	return table.clone(Visuals._order)
+end
+
+-- built-in presets ------------------------------------------------------
+
+Visuals:AddPreset("Cinematic", {
+	Bloom = { Intensity = 0.6, Size = 28, Threshold = 1.2 },
+	ColorCorrection = { Contrast = 0.15, Saturation = -0.08, Brightness = -0.02, TintColor = RGB(255, 244, 232) },
+	DepthOfField = { FarIntensity = 0.12, FocusDistance = 40, InFocusRadius = 35, NearIntensity = 0 },
+	SunRays = { Intensity = 0.08, Spread = 0.6 },
+	Lighting = { ExposureCompensation = 0.1 },
+})
+
+Visuals:AddPreset("Vivid", {
+	Bloom = { Intensity = 0.4, Size = 24, Threshold = 1.4 },
+	ColorCorrection = { Saturation = 0.35, Contrast = 0.12, Brightness = 0.02 },
+	SunRays = { Intensity = 0.12, Spread = 0.8 },
+})
+
+Visuals:AddPreset("Soft Glow", {
+	Bloom = { Intensity = 1.1, Size = 40, Threshold = 0.8 },
+	ColorCorrection = { Brightness = 0.03, Saturation = 0.05, TintColor = RGB(255, 240, 250) },
+})
+
+Visuals:AddPreset("Moonlight", {
+	Bloom = { Intensity = 0.8, Size = 30, Threshold = 1 },
+	ColorCorrection = { TintColor = RGB(190, 205, 255), Saturation = -0.1, Contrast = 0.1 },
+	Atmosphere = { Density = 0.35, Color = RGB(150, 165, 220), Haze = 1.2, Glare = 0 },
+	Lighting = {
+		ClockTime = 0,
+		Brightness = 1,
+		Ambient = RGB(24, 28, 48),
+		OutdoorAmbient = RGB(38, 44, 76),
+		ExposureCompensation = 0.25,
+	},
+})
+
+Visuals:AddPreset("Warm Sunset", {
+	Bloom = { Intensity = 0.5, Size = 28, Threshold = 1.2 },
+	ColorCorrection = { TintColor = RGB(255, 224, 200), Saturation = 0.15, Contrast = 0.08 },
+	SunRays = { Intensity = 0.2, Spread = 0.9 },
+	Atmosphere = { Density = 0.3, Color = RGB(255, 200, 170), Haze = 1.5, Glare = 0.6 },
+	Lighting = { ClockTime = 17.6 },
+})
+
+Visuals:AddPreset("Noir", {
+	Bloom = { Intensity = 0.3, Size = 24, Threshold = 1.6 },
+	ColorCorrection = { Saturation = -1, Contrast = 0.25, Brightness = -0.03 },
+})
+
+return Visuals
+end
+
 modules["Main"] = function(...)
 -- Entry point: loads every module in dependency order and returns the Moon library table.
 local import = ...
@@ -194,11 +2101,36 @@ local Moon = import("Core/Moon")
 
 import("Theme/Registry")
 import("Theme/Presets")
+import("Core/Config")
 import("UI/Elements/Index")
 import("Window/Window")
 import("Window/Tab")
 import("Window/Notify")
 import("Window/Create")
+
+-- Optional extras. Nothing here runs unless you ask for it:
+--   Moon:Use("ESP")  /  Moon:Use({ "ESP", "TargetCard", "Visuals" })
+local EXTRAS = {
+	ESP = "Extras/ESP/Index",
+	TargetCard = "Extras/TargetCard",
+	Visuals = "Extras/Visuals/Index",
+}
+
+function Moon:Use(...)
+	local names = { ... }
+	if type(names[1]) == "table" then
+		names = names[1]
+	end
+	for _, name in ipairs(names) do
+		local path = EXTRAS[name]
+		if path then
+			import(path)
+		else
+			warn("[Moon] unknown extra: " .. tostring(name) .. " (available: ESP, TargetCard, Visuals)")
+		end
+	end
+	return Moon
+end
 
 return Moon
 end
@@ -309,7 +2241,18 @@ local function AccentKeys(accent)
 	}
 end
 
+-- red -> amber -> green for a 0..1 health fraction
+local HEALTH_RED, HEALTH_AMBER, HEALTH_GREEN = RGB(226, 100, 88), RGB(232, 184, 92), RGB(120, 200, 140)
+local function HealthColor(fraction)
+	fraction = math.clamp(fraction, 0, 1)
+	if fraction > 0.5 then
+		return HEALTH_AMBER:Lerp(HEALTH_GREEN, (fraction - 0.5) * 2)
+	end
+	return HEALTH_RED:Lerp(HEALTH_AMBER, fraction * 2)
+end
+
 return {
+	HealthColor = HealthColor,
 	WHITE = WHITE,
 	BLACK = BLACK,
 	RGB = RGB,
@@ -561,7 +2504,7 @@ local Elements = import("UI/Elements/Base")
 local Fonts = import("Core/Fonts")
 local FONT_MED = Fonts.FONT_MED
 local Util = import("Core/Util")
-local Create, Tween, Corner, Safe = Util.Create, Util.Tween, Util.Corner, Util.Safe
+local Create, Tween, Corner, Safe, IsTouchInput = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.IsTouchInput
 local Binding = import("Theme/Binding")
 local Themed = Binding.Themed
 
@@ -597,7 +2540,7 @@ function Elements:AddButton(opts)
 		Tween(press, { Scale = 0.95 }, 0.06)
 	end)
 	btn.MouseButton1Up:Connect(function()
-		Tween(btn, { BackgroundColor3 = theme.AccentHover }, 0.12)
+		Tween(btn, { BackgroundColor3 = IsTouchInput() and theme.Accent or theme.AccentHover }, 0.12)
 		Tween(press, { Scale = 1 }, 0.2, Enum.EasingStyle.Back)
 	end)
 	btn.MouseButton1Click:Connect(function()
@@ -627,7 +2570,7 @@ local FONT, FONT_MED = Fonts.FONT, Fonts.FONT_MED
 local Colors = import("Theme/Colors")
 local WHITE, BLACK, RGB, ToHex, FromHex = Colors.WHITE, Colors.BLACK, Colors.RGB, Colors.ToHex, Colors.FromHex
 local Util = import("Core/Util")
-local Create, Tween, Corner, Safe, SetFlag, IsPress, IsMove = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.SetFlag, Util.IsPress, Util.IsMove
+local Create, Tween, Corner, Safe, SetFlag, IsPress, IsMove, ScrollIntoView = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.SetFlag, Util.IsPress, Util.IsMove, Util.ScrollIntoView
 local Binding = import("Theme/Binding")
 local Themed, NewText, Stroke = Binding.Themed, Binding.NewText, Binding.Stroke
 
@@ -895,6 +2838,9 @@ function Elements:AddColorPicker(opts)
 	local function toggle(state)
 		open = state
 		Tween(card, { Size = UDim2.new(1, 0, 0, open and (rowH + panelH) or rowH) }, 0.24)
+		if open and self.Page then
+			ScrollIntoView(self.Page, card)
+		end
 	end
 	rowButton.MouseButton1Click:Connect(function()
 		toggle(not open)
@@ -910,34 +2856,173 @@ end
 return Elements
 end
 
+modules["UI/Elements/Config"] = function(...)
+-- Ready-made config panel: pick, save, load and delete configs, plus auto load / auto save.
+local import = ...
+
+local Moon = import("Core/Moon")
+local Elements = import("UI/Elements/Base")
+
+function Elements:AddConfigManager()
+	local window = self.Window
+	local selected = Moon:GetAutoLoad()
+	local typedName = ""
+	local autoLoad, autoSave
+
+	local function notify(title, content)
+		window:Notify({ Title = title, Content = content, Duration = 3 })
+	end
+
+	local list = self:AddDropdown({
+		Name = "Config",
+		Description = "Pick a saved config",
+		Options = Moon:ListConfigs(),
+		Default = selected,
+		Callback = function(value)
+			selected = value
+		end,
+	})
+
+	local function refresh(keep)
+		list:Refresh(Moon:ListConfigs(), true)
+		list:Set(keep, true)
+	end
+
+	self:AddTextbox({
+		Name = "New config",
+		Placeholder = "name",
+		Callback = function(text)
+			typedName = text
+		end,
+	})
+
+	self:AddButton({
+		Name = "Save",
+		Description = "Saves your current settings",
+		ButtonText = "Save",
+		Callback = function()
+			local name = typedName ~= "" and typedName or selected
+			if not name or name == "" then
+				notify("Config", "Type a name or pick a config first")
+				return
+			end
+			local ok, result = Moon:SaveConfig(name)
+			if ok then
+				selected = result
+				refresh(result)
+				notify("Config saved", result)
+			else
+				notify("Could not save", tostring(result))
+			end
+		end,
+	})
+
+	self:AddButton({
+		Name = "Load",
+		Description = "Applies the selected config",
+		ButtonText = "Load",
+		Callback = function()
+			if not selected then
+				notify("Config", "Pick a config first")
+				return
+			end
+			local ok, result = Moon:LoadConfig(selected)
+			if ok then
+				notify("Config loaded", selected .. " (" .. tostring(result) .. " settings)")
+			else
+				notify("Could not load", tostring(result))
+			end
+		end,
+	})
+
+	self:AddButton({
+		Name = "Delete",
+		Description = "Deletes the selected config",
+		ButtonText = "Delete",
+		Callback = function()
+			if not selected then
+				notify("Config", "Pick a config first")
+				return
+			end
+			local ok, err = Moon:DeleteConfig(selected)
+			if ok then
+				notify("Config deleted", selected)
+				selected = nil
+				refresh(nil)
+				autoLoad:Set(Moon:GetAutoLoad() ~= nil, true)
+			else
+				notify("Could not delete", tostring(err))
+			end
+		end,
+	})
+
+	autoLoad = self:AddToggle({
+		Name = "Auto load",
+		Description = "Loads the selected config when the script starts",
+		Default = Moon:GetAutoLoad() ~= nil,
+		Callback = function(state)
+			if state and not selected then
+				notify("Config", "Pick a config first")
+				autoLoad:Set(false, true)
+				return
+			end
+			Moon:SetAutoLoad(state and selected or nil)
+		end,
+	})
+
+	autoSave = self:AddToggle({
+		Name = "Auto save",
+		Description = "Saves the selected config whenever you change something",
+		Default = false,
+		Callback = function(state)
+			local target = selected or Moon._currentConfig
+			if state and not target then
+				notify("Config", "Pick or save a config first")
+				autoSave:Set(false, true)
+				return
+			end
+			Moon:SetAutoSave(state, target)
+		end,
+	})
+
+	return { Refresh = refresh }
+end
+
+return Elements
+end
+
 modules["UI/Elements/Dropdown"] = function(...)
--- Dropdown.
+-- Dropdown. The option list opens as a floating popup instead of inside the scrolling page:
+--   PC:     anchored under the box (flips above when there is no room); closes when you scroll or move the window
+--   Mobile: a centered sheet with a dim backdrop and big touch rows (no nested scrolling)
 local import = ...
 
 local Card = import("UI/Card")
 local Elements = import("UI/Elements/Base")
+local Services = import("Core/Services")
+local UserInputService = Services.UserInputService
+local Colors = import("Theme/Colors")
+local BLACK = Colors.BLACK
 local Fonts = import("Core/Fonts")
-local FONT, FONT_BOLD = Fonts.FONT, Fonts.FONT_BOLD
+local FONT, FONT_MED, FONT_BOLD = Fonts.FONT, Fonts.FONT_MED, Fonts.FONT_BOLD
 local Util = import("Core/Util")
-local Create, Tween, Corner, List, Safe, SetFlag = Util.Create, Util.Tween, Util.Corner, Util.List, Util.Safe, Util.SetFlag
+local Create, Tween, Corner, List, Pad, Safe, SetFlag, IsPress = Util.Create, Util.Tween, Util.Corner, Util.List, Util.Pad, Util.Safe, Util.SetFlag, Util.IsPress
 local Binding = import("Theme/Binding")
-local Bind, Themed, NewText, Stroke = Binding.Bind, Binding.Themed, Binding.NewText, Binding.Stroke
+local Themed, NewText, Stroke = Binding.Themed, Binding.NewText, Binding.Stroke
 
 function Elements:AddDropdown(opts)
 	opts = opts or {}
 	local window, theme = self.Window, self.Theme
 	local options = opts.Options or {}
 	local selected = opts.Default
-	local open = false
-	local buttons = {}
+	local popup = nil
 	local obj = {}
 
-	local card, rowH, cy = Card(self, opts, 0.45)
-	card.ClipsDescendants = true
+	local card, _, cy = Card(self, opts, 0.42)
 	obj.Instance = card
 
 	local combo = Create("TextButton", {
-		Size = UDim2.new(0.38, 0, 0, 30),
+		Size = UDim2.new(0.4, 0, 0, 32),
 		AnchorPoint = Vector2.new(1, 0.5),
 		Position = UDim2.new(1, -14, 0, cy),
 		AutoButtonColor = false,
@@ -948,6 +3033,8 @@ function Elements:AddDropdown(opts)
 	Themed(window, combo, { BackgroundColor3 = "Control", BackgroundTransparency = "ControlTransparency" })
 	Corner(combo, 4)
 	Stroke(window, combo, "Stroke", "StrokeTransparency")
+	-- never get squeezed too small on narrow screens
+	Create("UISizeConstraint", { MinSize = Vector2.new(104, 32), MaxSize = Vector2.new(240, 32), Parent = combo })
 	local valueLabel = NewText(window, combo, "", {
 		Size = UDim2.new(1, -30, 1, 0),
 		Position = UDim2.fromOffset(10, 0),
@@ -965,86 +3052,231 @@ function Elements:AddDropdown(opts)
 		Rotation = 90,
 	}, "SubText")
 
-	local list = Create("ScrollingFrame", {
-		Position = UDim2.fromOffset(8, rowH + 2),
-		Size = UDim2.new(1, -16, 0, 0),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ScrollBarThickness = 3,
-		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		Parent = card,
-	})
-	Bind(window, list, "ScrollBarImageColor3", "Accent")
-	List(list, 2)
-
-	local function listHeight()
-		return math.min(#options * 34, 170)
-	end
-
 	local function render()
 		valueLabel.Text = selected ~= nil and tostring(selected) or "None"
-		for opt, entry in pairs(buttons) do
-			entry.pill.Visible = (opt == selected)
-		end
 	end
 
-	local function toggle(state)
-		open = state
-		Tween(card, { Size = UDim2.new(1, 0, 0, open and (rowH + 10 + listHeight()) or rowH) }, 0.2)
-		Tween(arrow, { Rotation = open and -90 or 90 }, 0.2)
+	local function closePopup()
+		local current = popup
+		if not current then
+			return
+		end
+		popup = nil
+		if window._closePopup == closePopup then
+			window._closePopup = nil
+		end
+		for _, connection in ipairs(current.conns) do
+			connection:Disconnect()
+		end
+		Tween(arrow, { Rotation = 90 }, 0.15)
+		Tween(current.frame, { GroupTransparency = 1 }, 0.12)
+		Tween(current.scale, { Scale = 0.96 }, 0.12)
+		Tween(current.backdrop, { BackgroundTransparency = 1 }, 0.12)
+		task.delay(0.14, function()
+			current.root:Destroy()
+		end)
 	end
 
-	local function build()
-		for _, entry in pairs(buttons) do
-			entry.button:Destroy()
+	local function openPopup()
+		if window._closePopup then
+			window._closePopup()
 		end
-		table.clear(buttons)
-		for _, opt in ipairs(options) do
-			local button = Create("TextButton", {
-				Size = UDim2.new(1, -6, 0, 32),
+
+		local gui = window.Gui
+		local sheet = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+		local view = gui.AbsoluteSize
+		local rowSize = sheet and 44 or 34
+		local headerH = sheet and 46 or 0
+		local listH = #options * (rowSize + 2) + 8
+		local width, height, x, y
+
+		if sheet then
+			-- phones: centered sheet, up to 82% of the screen height
+			width = math.min(320, view.X - 32)
+			height = math.min(headerH + listH, math.floor(view.Y * 0.82))
+			x = (view.X - width) / 2
+			y = (view.Y - height) / 2
+		else
+			-- PC: under the box, or above it when there is more room there
+			local origin = combo.AbsolutePosition - gui.AbsolutePosition
+			local box = combo.AbsoluteSize
+			width = math.max(box.X, 170)
+			local below = view.Y - (origin.Y + box.Y) - 14
+			local above = origin.Y - 14
+			height = math.min(listH, 260)
+			if height > below and above > below then
+				height = math.min(height, math.max(above, rowSize + 8))
+				y = origin.Y - height - 6
+			else
+				height = math.min(height, math.max(below, rowSize + 8))
+				y = origin.Y + box.Y + 6
+			end
+			x = math.clamp(origin.X + box.X - width, 8, math.max(8, view.X - width - 8))
+		end
+		y = math.clamp(y, 6, math.max(6, view.Y - height - 6))
+
+		local root = Create("Frame", {
+			Name = "MoonDropdown",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ZIndex = 100,
+			Parent = gui,
+		})
+		local backdrop = Create("TextButton", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = BLACK,
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Text = "",
+			BorderSizePixel = 0,
+			ZIndex = 100,
+			Parent = root,
+		})
+		if sheet then
+			Tween(backdrop, { BackgroundTransparency = 0.5 }, 0.18)
+		end
+		local frame = Create("CanvasGroup", {
+			Size = UDim2.fromOffset(width, height),
+			Position = UDim2.fromOffset(x, y),
+			BackgroundColor3 = theme.Background,
+			BackgroundTransparency = 0.02,
+			BorderSizePixel = 0,
+			GroupTransparency = 1,
+			ZIndex = 101,
+			Parent = root,
+		})
+		Corner(frame, 10)
+		Create("UIStroke", {
+			Color = theme.Border,
+			Transparency = theme.BorderTransparency,
+			Thickness = 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = frame,
+		})
+		local scale = Create("UIScale", { Scale = 0.96, Parent = frame })
+		Tween(frame, { GroupTransparency = 0 }, 0.16)
+		Tween(scale, { Scale = 1 }, 0.2, Enum.EasingStyle.Back)
+
+		if sheet then
+			Create("TextLabel", {
 				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, headerH),
+				Text = opts.Name or "Select",
+				TextColor3 = theme.Text,
+				Font = FONT_BOLD,
+				TextSize = 15,
+				Parent = frame,
+			})
+			Create("Frame", {
+				Size = UDim2.new(1, -24, 0, 1),
+				Position = UDim2.new(0, 12, 0, headerH - 1),
+				BackgroundColor3 = theme.Text,
+				BackgroundTransparency = 0.88,
+				BorderSizePixel = 0,
+				Parent = frame,
+			})
+		end
+
+		local list = Create("ScrollingFrame", {
+			Position = UDim2.fromOffset(0, headerH),
+			Size = UDim2.new(1, 0, 1, -headerH),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = theme.Accent,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			Parent = frame,
+		})
+		List(list, 2)
+		Pad(list, 6, 4, 6, 4)
+
+		local selectedIndex = 1
+		for index, opt in ipairs(options) do
+			local isSelected = opt == selected
+			local rest = isSelected and 0.92 or 1
+			if isSelected then
+				selectedIndex = index
+			end
+			local button = Create("TextButton", {
+				Size = UDim2.new(1, 0, 0, rowSize),
+				BackgroundColor3 = theme.Text,
+				BackgroundTransparency = rest,
 				AutoButtonColor = false,
 				Text = "",
 				BorderSizePixel = 0,
 				Parent = list,
 			})
-			Bind(window, button, "BackgroundColor3", "Text")
-			Corner(button, 4)
-			NewText(window, button, tostring(opt), {
-				Size = UDim2.new(1, -24, 1, 0),
-				Position = UDim2.fromOffset(14, 0),
-				Font = FONT,
-				TextSize = 13,
+			Corner(button, 6)
+			Create("TextLabel", {
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, -28, 1, 0),
+				Position = UDim2.fromOffset(16, 0),
+				Text = tostring(opt),
+				TextColor3 = isSelected and theme.Accent or theme.Text,
+				Font = FONT_MED,
+				TextSize = sheet and 15 or 13,
+				TextXAlignment = Enum.TextXAlignment.Left,
 				TextTruncate = Enum.TextTruncate.AtEnd,
-			})
-			local pill = Create("Frame", {
-				Size = UDim2.fromOffset(3, 14),
-				AnchorPoint = Vector2.new(0, 0.5),
-				Position = UDim2.new(0, 3, 0.5, 0),
-				BorderSizePixel = 0,
-				Visible = false,
 				Parent = button,
 			})
-			Bind(window, pill, "BackgroundColor3", "Accent")
-			Corner(pill, "pill")
-			button.MouseEnter:Connect(function()
-				Tween(button, { BackgroundTransparency = 0.92 }, 0.1)
+			if isSelected then
+				local pill = Create("Frame", {
+					Size = UDim2.fromOffset(3, 16),
+					AnchorPoint = Vector2.new(0, 0.5),
+					Position = UDim2.new(0, 4, 0.5, 0),
+					BackgroundColor3 = theme.Accent,
+					BorderSizePixel = 0,
+					Parent = button,
+				})
+				Corner(pill, "pill")
+			end
+			-- hover only for mouse users; press feedback for everyone (no highlight stuck on touch)
+			if not sheet then
+				button.MouseEnter:Connect(function()
+					Tween(button, { BackgroundTransparency = 0.9 }, 0.08)
+				end)
+				button.MouseLeave:Connect(function()
+					Tween(button, { BackgroundTransparency = rest }, 0.08)
+				end)
+			end
+			button.InputBegan:Connect(function(input)
+				if IsPress(input) then
+					Tween(button, { BackgroundTransparency = 0.84 }, 0.05)
+				end
 			end)
-			button.MouseLeave:Connect(function()
-				Tween(button, { BackgroundTransparency = 1 }, 0.1)
+			button.InputEnded:Connect(function(input)
+				if IsPress(input) then
+					Tween(button, { BackgroundTransparency = rest }, 0.1)
+				end
 			end)
 			button.MouseButton1Click:Connect(function()
 				obj:Set(opt)
-				toggle(false)
+				closePopup()
 			end)
-			buttons[opt] = { button = button, pill = pill }
 		end
-		list.Size = UDim2.new(1, -16, 0, listHeight())
-		if open then
-			card.Size = UDim2.new(1, 0, 0, rowH + 10 + listHeight())
+
+		task.delay(0.03, function()
+			if list.Parent then
+				local rowTop = (selectedIndex - 1) * (rowSize + 2)
+				list.CanvasPosition = Vector2.new(0, math.max(0, rowTop - (height - headerH) / 2 + rowSize / 2))
+			end
+		end)
+
+		local conns = {}
+		backdrop.MouseButton1Click:Connect(closePopup)
+		if not sheet then
+			-- an anchored popup would drift away from its box, so close it instead
+			if self.Page then
+				table.insert(conns, self.Page:GetPropertyChangedSignal("CanvasPosition"):Connect(closePopup))
+			end
+			table.insert(conns, window.Main:GetPropertyChangedSignal("Position"):Connect(closePopup))
+			table.insert(conns, window.Main:GetPropertyChangedSignal("Size"):Connect(closePopup))
 		end
-		render()
+
+		popup = { root = root, frame = frame, scale = scale, backdrop = backdrop, conns = conns }
+		window._closePopup = closePopup
+		Tween(arrow, { Rotation = -90 }, 0.15)
 	end
 
 	function obj:Set(value, silent)
@@ -1059,19 +3291,24 @@ function Elements:AddDropdown(opts)
 		return selected
 	end
 	function obj:Refresh(newOptions, keepSelection)
+		closePopup()
 		options = newOptions or {}
 		if not keepSelection or not table.find(options, selected) then
 			selected = nil
 			SetFlag(opts, nil)
 		end
-		build()
+		render()
 	end
 
 	combo.MouseButton1Click:Connect(function()
-		toggle(not open)
+		if popup then
+			closePopup()
+		else
+			openPopup()
+		end
 	end)
 
-	build()
+	render()
 	SetFlag(opts, selected)
 	return obj
 end
@@ -1191,6 +3428,8 @@ import("UI/Elements/Textbox")
 import("UI/Elements/Keybind")
 import("UI/Elements/ColorPicker")
 import("UI/Elements/Helpers")
+import("UI/Elements/Track")
+import("UI/Elements/Config")
 
 return import("UI/Elements/Base")
 end
@@ -1668,6 +3907,29 @@ end
 return Elements
 end
 
+modules["UI/Elements/Track"] = function(...)
+-- Registers every element that has a Flag so a saved config can set it back later.
+local import = ...
+
+local Moon = import("Core/Moon")
+local Elements = import("UI/Elements/Base")
+
+local TRACKED = { "AddToggle", "AddSlider", "AddDropdown", "AddTextbox", "AddKeybind", "AddColorPicker" }
+
+for _, method in ipairs(TRACKED) do
+	local original = Elements[method]
+	Elements[method] = function(self, opts)
+		local object = original(self, opts)
+		if type(opts) == "table" and opts.Flag then
+			Moon._elements[opts.Flag] = object
+		end
+		return object
+	end
+end
+
+return Elements
+end
+
 modules["UI/Logo"] = function(...)
 -- The Moon logo: a crescent drawn from thin horizontal slices (no images, no emojis).
 -- Pass an asset string (Logo = "rbxassetid://...") to use your own image instead.
@@ -2099,6 +4361,7 @@ function Moon:CreateWindow(opts)
 			return GuiService:GetGuiInset()
 		end)
 		local top = ok and inset.Y or 0
+		self._topInset = top
 		self.Watermark.Instance.Position = UDim2.new(1, -12, 0, 12 + top)
 		if isTouch then
 			notifyHolder.Position = UDim2.new(1, -12, 0, 58 + top)
@@ -2178,6 +4441,7 @@ function Moon:Unload()
 		window:Destroy()
 	end
 	table.clear(Moon.Flags)
+	table.clear(Moon._elements)
 end
 
 return Moon
@@ -2559,6 +4823,9 @@ function Window:AddTab(name)
 	table.insert(self.Tabs, tab)
 
 	function tab:Select()
+		if window._closePopup then
+			window._closePopup()
+		end
 		for _, other in ipairs(window.Tabs) do
 			local active = other == self
 			if active and not other._active then
@@ -2855,6 +5122,9 @@ function Window:SetVisible(visible)
 	self.Visible = visible
 	self._tray.Visible = not visible
 	self:_syncBlur()
+	if not visible and self._closePopup then
+		self._closePopup()
+	end
 	if visible then
 		self.Main.Visible = true
 		self.Main.GroupTransparency = 1

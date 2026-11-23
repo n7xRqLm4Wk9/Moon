@@ -81,6 +81,9 @@ function Window:AddTab(name)
 	table.insert(self.Tabs, tab)
 
 	function tab:Select()
+		if window._closePopup then
+			window._closePopup()
+		end
 		for _, other in ipairs(window.Tabs) do
 			local active = other == self
 			if active and not other._active then

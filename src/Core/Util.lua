@@ -1,6 +1,8 @@
 -- General helpers: instance creation, tweens, layout shortcuts, input helpers.
 local import = ...
 
+local UserInputService = import("Core/Services").UserInputService
+
 local Moon = import("Core/Moon")
 local Services = import("Core/Services")
 local Players, TweenService = Services.Players, Services.TweenService
@@ -82,6 +84,9 @@ end
 local function SetFlag(opts, value)
 	if opts.Flag then
 		Moon.Flags[opts.Flag] = value
+		if Moon._onFlag then
+			Moon._onFlag(opts.Flag)
+		end
 	end
 end
 
@@ -105,7 +110,27 @@ local function GetGuiParent()
 	return Players.LocalPlayer:WaitForChild("PlayerGui")
 end
 
+-- true when the last thing the player used was a touchscreen
+local function IsTouchInput()
+	return UserInputService:GetLastInputType() == Enum.UserInputType.Touch
+end
+
+-- scrolls `page` so `target` is fully visible (used after a card expands near the bottom)
+local function ScrollIntoView(page, target)
+	task.delay(0.26, function()
+		if not (page.Parent and target.Parent) then
+			return
+		end
+		local overflow = (target.AbsolutePosition.Y + target.AbsoluteSize.Y) - (page.AbsolutePosition.Y + page.AbsoluteSize.Y) + 12
+		if overflow > 0 then
+			Tween(page, { CanvasPosition = Vector2.new(0, page.CanvasPosition.Y + overflow) }, 0.2)
+		end
+	end)
+end
+
 return {
+	IsTouchInput = IsTouchInput,
+	ScrollIntoView = ScrollIntoView,
 	Create = Create,
 	Tween = Tween,
 	Apply = Apply,

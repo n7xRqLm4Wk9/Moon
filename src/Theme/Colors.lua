@@ -38,7 +38,18 @@ local function AccentKeys(accent)
 	}
 end
 
+-- red -> amber -> green for a 0..1 health fraction
+local HEALTH_RED, HEALTH_AMBER, HEALTH_GREEN = RGB(226, 100, 88), RGB(232, 184, 92), RGB(120, 200, 140)
+local function HealthColor(fraction)
+	fraction = math.clamp(fraction, 0, 1)
+	if fraction > 0.5 then
+		return HEALTH_AMBER:Lerp(HEALTH_GREEN, (fraction - 0.5) * 2)
+	end
+	return HEALTH_RED:Lerp(HEALTH_AMBER, fraction * 2)
+end
+
 return {
+	HealthColor = HealthColor,
 	WHITE = WHITE,
 	BLACK = BLACK,
 	RGB = RGB,

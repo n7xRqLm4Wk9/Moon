@@ -6,7 +6,7 @@ local Elements = import("UI/Elements/Base")
 local Fonts = import("Core/Fonts")
 local FONT_MED = Fonts.FONT_MED
 local Util = import("Core/Util")
-local Create, Tween, Corner, Safe = Util.Create, Util.Tween, Util.Corner, Util.Safe
+local Create, Tween, Corner, Safe, IsTouchInput = Util.Create, Util.Tween, Util.Corner, Util.Safe, Util.IsTouchInput
 local Binding = import("Theme/Binding")
 local Themed = Binding.Themed
 
@@ -42,7 +42,7 @@ function Elements:AddButton(opts)
 		Tween(press, { Scale = 0.95 }, 0.06)
 	end)
 	btn.MouseButton1Up:Connect(function()
-		Tween(btn, { BackgroundColor3 = theme.AccentHover }, 0.12)
+		Tween(btn, { BackgroundColor3 = IsTouchInput() and theme.Accent or theme.AccentHover }, 0.12)
 		Tween(press, { Scale = 1 }, 0.2, Enum.EasingStyle.Back)
 	end)
 	btn.MouseButton1Click:Connect(function()
