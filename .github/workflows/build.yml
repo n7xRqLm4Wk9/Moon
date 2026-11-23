@@ -1,0 +1,39 @@
+name: Build bundle
+
+# Rebuilds dist/Moon.bundle.lua (and the module list in Moon.lua) whenever src/ or build.py changes,
+# so the bundle people load can never be out of date.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "build.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build
+        run: python3 build.py
+
+      - name: Commit the result
+        run: |
+          git config user.name "moon-build[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git add Moon.lua dist/Moon.bundle.lua
+          if git diff --cached --quiet; then
+            echo "Bundle already up to date"
+          else
+            git commit -m "build: update bundle [skip ci]"
+            git push
+          fi

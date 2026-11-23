@@ -76,6 +76,8 @@ local Moon = loadstring(readfile("Moon/Moon.lua"))()
 
 After changing anything in `src/`, run `python3 build.py` and commit `dist/` too.
 
+Or let GitHub do it: `.github/workflows/build.yml` rebuilds `dist/Moon.bundle.lua` on every push that touches `src/` or `build.py`, and commits the result as `moon-build[bot]`. Because of that, run `git pull --rebase` before your next push.
+
 ## Create a window
 
 ```lua
